@@ -7,30 +7,36 @@ sklearn-conforming classes like NeuralNetClassifier.
 """
 
 import fnmatch
+from collections.abc import Mapping
 from functools import partial
 from itertools import chain
 from collections import OrderedDict
 from contextlib import contextmanager
+import os
+import pickle
 import tempfile
 import warnings
 
 import numpy as np
 from sklearn.base import BaseEstimator
+from sklearn.exceptions import NotFittedError
 import torch
 from torch.utils.data import DataLoader
 
 from skorch.callbacks import EpochTimer
 from skorch.callbacks import PrintLog
 from skorch.callbacks import PassthroughScoring
-from skorch.callbacks.base import _issue_warning_if_on_batch_override
 from skorch.dataset import Dataset
 from skorch.dataset import ValidSplit
 from skorch.dataset import get_len
 from skorch.dataset import unpack_data
 from skorch.exceptions import DeviceWarning
+from skorch.exceptions import NotInitializedError
 from skorch.exceptions import SkorchAttributeError
+from skorch.exceptions import SkorchTrainingImpossibleError
 from skorch.history import History
 from skorch.setter import optimizer_setter
+from skorch.utils import _TorchLoadUnpickler
 from skorch.utils import _identity
 from skorch.utils import _infer_predict_nonlinearity
 from skorch.utils import FirstStepAccumulator
@@ -44,10 +50,11 @@ from skorch.utils import params_for
 from skorch.utils import to_device
 from skorch.utils import to_numpy
 from skorch.utils import to_tensor
+from skorch.utils import get_default_torch_load_kwargs
 
 
 # pylint: disable=too-many-instance-attributes
-class NeuralNet:
+class NeuralNet(BaseEstimator):
     # pylint: disable=anomalous-backslash-in-string
     """NeuralNet base class.
 
@@ -83,7 +90,7 @@ class NeuralNet:
 
     By default an :class:`.EpochTimer`, :class:`.BatchScoring` (for
     both training and validation datasets), and :class:`.PrintLog`
-    callbacks are installed for the user's convenience.
+    callbacks are added for convenience.
 
     Parameters
     ----------
@@ -135,10 +142,10 @@ class NeuralNet:
       arguments may be passed.
 
     train_split : None or callable (default=skorch.dataset.ValidSplit(5))
-      If None, there is no train/validation split. Else, train_split
+      If ``None``, there is no train/validation split. Else, ``train_split``
       should be a function or callable that is called with X and y
       data and should return the tuple ``dataset_train, dataset_valid``.
-      The validation data may be None.
+      The validation data may be ``None``.
 
     callbacks : None, "disable", or list of Callback instances (default=None)
       Which callbacks to enable. There are three possible values:
@@ -147,7 +154,7 @@ class NeuralNet:
       those returned by ``get_default_callbacks``.
 
       If ``callbacks="disable"``, disable all callbacks, i.e. do not run
-      any of the callbacks.
+      any of the callbacks, not even the default callbacks.
 
       If ``callbacks`` is a list of callbacks, use those callbacks in
       addition to the default callbacks. Each callback should be an
@@ -203,18 +210,70 @@ class NeuralNet:
       summary scores are always logged in the history attribute,
       regardless of the verbose setting.
 
-    device : str, torch.device (default='cpu')
-      The compute device to be used. If set to 'cuda', data in torch
-      tensors will be pushed to cuda tensors before being sent to the
-      module. If set to None, then all compute devices will be left
-      unmodified.
+    device : str, torch.device, or None (default='cpu')
+      The compute device to be used. If set to 'cuda' in order to use
+      GPU acceleration, data in torch tensors will be pushed to cuda
+      tensors before being sent to the module. If set to None, then
+      all compute devices will be left unmodified.
+
+    compile : bool (default=False)
+      If set to ``True``, compile all modules using ``torch.compile``. For this
+      to work, the installed torch version has to support ``torch.compile``.
+      Compiled modules should work identically to non-compiled modules but
+      should run faster on new GPU architectures (Volta and Ampere for
+      instance).
+      Additional arguments for ``torch.compile`` can be passed using the dunder
+      notation, e.g. when initializing the net with ``compile__dynamic=True``,
+      ``torch.compile`` will be called with ``dynamic=True``.
+
+    use_caching : bool or 'auto' (default='auto')
+      Optionally override the caching behavior of scoring callbacks. Callbacks
+      such as :class:`.EpochScoring` and :class:`.BatchScoring` allow to cache
+      the inference call to save time when calculating scores during training at
+      the expense of memory. In certain situations, e.g. when memory is tight,
+      you may want to disable caching. As it is cumbersome to change the setting
+      on each callback individually, this parameter allows to override their
+      behavior globally.
+      By default (``'auto'``), the callbacks will determine if caching is used
+      or not. If this argument is set to ``False``, caching will be disabled on
+      all callbacks. If set to ``True``, caching will be enabled on all
+      callbacks.
+      Implementation note: It is the job of the callbacks to honor this setting.
+
+    torch_load_kwargs : dict or None (default=None)
+      Additional arguments that will be passed to torch.load when load pickled
+      parameters.
+
+      In particular, this is important to because PyTorch will switch (probably
+      in version 2.6.0) to only allow weights to be loaded for security reasons
+      (i.e weights_only switches from False to True). As a consequence, loading
+      pickled parameters may raise an error after upgrading torch because some
+      types are used that are considered insecure. In skorch, we will also make
+      that switch at the same time. To resolve the error, follow the
+      instructions in the torch error message to designate the offending types
+      as secure. Only do this if you trust the source of the file.
+
+      If you want to keep loading non-weight types the same way as before,
+      please pass:
+
+          torch_load_kwargs={'weights_only': False}
+
+      You should be aware that this is considered insecure and should only be
+      used if you trust the source of the file. However, this does not introduce
+      new insecurities, it rather corresponds to the status quo from before
+      torch made the switch.
+
+      Another way to avoid this issue is to pass use_safetensors=True when
+      calling save_params and load_params. This avoid using pickle in favor of
+      the safetensors format, which is secure by design.
 
     Attributes
     ----------
     prefixes_ : list of str
       Contains the prefixes to special parameters. E.g., since there
-      is the ``'module'`` prefix, it is possible to set parameters like
-      so: ``NeuralNet(..., optimizer__momentum=0.95)``.
+      is the ``'optimizer'`` prefix, it is possible to set parameters like
+      so: ``NeuralNet(..., optimizer__momentum=0.95)``. Some prefixes are
+      populated dynamically, based on what modules and criteria are defined.
 
     cuda_dependent_attributes_ : list of str
       Contains a list of all attribute prefixes whose values depend on a
@@ -252,7 +311,7 @@ class NeuralNet:
       this list.
 
     """
-    prefixes_ = ['iterator_train', 'iterator_valid', 'callbacks', 'dataset']
+    prefixes_ = ['iterator_train', 'iterator_valid', 'callbacks', 'dataset', 'compile']
 
     cuda_dependent_attributes_ = []
 
@@ -282,6 +341,9 @@ class NeuralNet:
             warm_start=False,
             verbose=1,
             device='cpu',
+            compile=False,
+            use_caching='auto',
+            torch_load_kwargs=None,
             **kwargs
     ):
         self.module = module
@@ -299,13 +361,16 @@ class NeuralNet:
         self.warm_start = warm_start
         self.verbose = verbose
         self.device = device
+        self.compile = compile
+        self.use_caching = use_caching
+        self.torch_load_kwargs = torch_load_kwargs
 
         self._check_deprecated_params(**kwargs)
         history = kwargs.pop('history', None)
         initialized = kwargs.pop('initialized_', False)
         virtual_params = kwargs.pop('virtual_params_', dict())
 
-        self._kwargs = kwargs
+        self._params_to_validate = set(kwargs.keys())
         vars(self).update(kwargs)
 
         self.history_ = history
@@ -350,10 +415,6 @@ class NeuralNet:
         * on_batch_end
 
         """
-        # TODO: remove after some deprecation period, e.g. skorch 0.12
-        if not self.history:  # perform check only at the start
-            _issue_warning_if_on_batch_override(self.callbacks_)
-
         getattr(self, method_name)(self, **cb_kwargs)
         for _, cb in self.callbacks_:
             getattr(cb, method_name)(self, **cb_kwargs)
@@ -508,7 +569,7 @@ class NeuralNet:
         return self
 
     def initialized_instance(self, instance_or_cls, kwargs):
-        """Return an instance initiliazed with the given parameters
+        """Return an instance initialized with the given parameters
 
         This is a helper method that deals with several possibilities for a
         component that might need to be initialized:
@@ -601,7 +662,7 @@ class NeuralNet:
           Deprecated, don't use it anymore.
 
         """
-        # handle deprecated paramter
+        # handle deprecated parameter
         if triggered_directly is not None:
             warnings.warn(
                 "The 'triggered_directly' argument to 'initialize_optimizer' is "
@@ -617,7 +678,10 @@ class NeuralNet:
 
     def initialize_history(self):
         """Initializes the history."""
-        self.history_ = History()
+        if self.history_ is None:
+            self.history_ = History()
+        else:
+            self.history_.clear()
         return self
 
     def _format_reinit_msg(self, name, kwargs=None, triggered_directly=True):
@@ -687,7 +751,9 @@ class NeuralNet:
             for name in self._criteria:
                 criterion = getattr(self, name + '_')
                 if isinstance(criterion, torch.nn.Module):
-                    setattr(self, name + '_', to_device(criterion, self.device))
+                    criterion = to_device(criterion, self.device)
+                    criterion = self.torch_compile(criterion, name=name)
+                    setattr(self, name + '_', criterion)
 
             return self
 
@@ -718,9 +784,62 @@ class NeuralNet:
             for name in self._modules:
                 module = getattr(self, name + '_')
                 if isinstance(module, torch.nn.Module):
-                    setattr(self, name + '_', to_device(module, self.device))
+                    module = to_device(module, self.device)
+                    module = self.torch_compile(module, name=name)
+                    setattr(self, name + '_', module)
 
             return self
+
+    # pylint: disable=unused-argument
+    def torch_compile(self, module, name):
+        """Compile torch modules
+
+        If ``compile=True`` was set, compile all torch modules of the net. Those
+        typically are ``module_`` and ``criterion_``, but custom modules are
+        also included if defined.
+
+        Notes
+        -----
+        Make sure that the installed PyTorch version supports compiling (v1.14,
+        v2.0 and higher).
+
+        Parameters
+        ----------
+        module : torch.nn.Module
+          The torch module to be compiled.
+
+        name : str
+          The name of the module. This argument is not used but provided for
+          convenience. You could use it, e.g., to skip compilation for specific
+          modules.
+
+        Returns
+        -------
+        module : torch.nn.Module or torch._dynamo.OptimizedModule
+          The compiled module if ``compile=True``, otherwise the uncompiled module.
+
+        Raises
+        ------
+        ValueError
+          If ``compile=True`` but ``torch.compile`` is not available, raise an
+          error.
+
+        """
+        # TODO: adjust docstring once we no longer support PyTorch versions without compile
+        if not self.compile:
+            return module
+
+        # Whether torch.compile is available (PyTorch 2.0 and up)
+        torch_compile_available = hasattr(torch, 'compile')
+        if not torch_compile_available:
+            raise ValueError(
+                "Setting compile=True but torch.compile is not available. Please "
+                f"check that your installed PyTorch version ({torch.__version__}) "
+                "supports torch.compile (requires v1.14, v2.0 or higher)")
+
+        params = self.get_params_for('compile')
+        module_compiled = torch.compile(module, **params)
+        return module_compiled
 
     def get_all_learnable_params(self):
         """Yield the learnable parameters of all modules
@@ -811,6 +930,8 @@ class NeuralNet:
 
     def initialize(self):
         """Initializes all of its components and returns self."""
+        self.check_training_readiness()
+
         self._initialize_virtual_params()
         self._initialize_callbacks()
         self._initialize_module()
@@ -818,10 +939,20 @@ class NeuralNet:
         self._initialize_optimizer()
         self._initialize_history()
 
-        self._check_kwargs(self._kwargs)
+        self._validate_params()
 
         self.initialized_ = True
         return self
+
+    def check_training_readiness(self):
+        """Check that the net is ready to train"""
+        is_trimmed_for_prediction = getattr(self, '_trimmed_for_prediction', False)
+        if is_trimmed_for_prediction:
+            msg = (
+                "The net's attributes were trimmed for prediction, thus it cannot "
+                "be used for training anymore"
+            )
+            raise SkorchTrainingImpossibleError(msg)
 
     def check_data(self, X, y=None):
         pass
@@ -1001,6 +1132,7 @@ class NeuralNet:
                 'on_grad_computed',
                 named_parameters=TeeGenerator(self.get_all_learnable_params()),
                 batch=batch,
+                training=True,
             )
             return step['loss']
 
@@ -1072,6 +1204,7 @@ class NeuralNet:
 
         """
         self.check_data(X, y)
+        self.check_training_readiness()
         epochs = epochs if epochs is not None else self.max_epochs
 
         dataset_train, dataset_valid = self.get_split_datasets(
@@ -1080,26 +1213,30 @@ class NeuralNet:
             'dataset_train': dataset_train,
             'dataset_valid': dataset_valid,
         }
+        iterator_train = self.get_iterator(dataset_train, training=True)
+        iterator_valid = None
+        if dataset_valid is not None:
+            iterator_valid = self.get_iterator(dataset_valid, training=False)
 
         for _ in range(epochs):
             self.notify('on_epoch_begin', **on_epoch_kwargs)
 
-            self.run_single_epoch(dataset_train, training=True, prefix="train",
+            self.run_single_epoch(iterator_train, training=True, prefix="train",
                                   step_fn=self.train_step, **fit_params)
 
-            self.run_single_epoch(dataset_valid, training=False, prefix="valid",
+            self.run_single_epoch(iterator_valid, training=False, prefix="valid",
                                   step_fn=self.validation_step, **fit_params)
 
             self.notify("on_epoch_end", **on_epoch_kwargs)
         return self
 
-    def run_single_epoch(self, dataset, training, prefix, step_fn, **fit_params):
+    def run_single_epoch(self, iterator, training, prefix, step_fn, **fit_params):
         """Compute a single epoch of train or validation.
 
         Parameters
         ----------
-        dataset : torch Dataset or None
-          The initialized dataset to loop over. If None, skip this step.
+        iterator : torch DataLoader or None
+          The initialized ``DataLoader`` to loop over. If None, skip this step.
 
         training : bool
           Whether to set the module to train mode or not.
@@ -1112,12 +1249,13 @@ class NeuralNet:
 
         **fit_params : dict
           Additional parameters passed to the ``step_fn``.
+
         """
-        if dataset is None:
+        if iterator is None:
             return
 
         batch_count = 0
-        for batch in self.get_iterator(dataset, training=training):
+        for batch in iterator:
             self.notify("on_batch_begin", batch=batch, training=training)
             step = step_fn(batch, **fit_params)
             self.history.record_batch(prefix + "_loss", step["loss"].item())
@@ -1233,8 +1371,80 @@ class NeuralNet:
           When the given attributes are not present.
 
         """
-        attributes = attributes or ['module_']
+        # first check attributes argument, but if it's empty, check that the
+        # indicated _modules exist, and if those are not defined, assume that
+        # the standard 'module_' attribute should exist
+        attributes = (
+            attributes or [module + '_' for module in self._modules] or ['module_']
+        )
         check_is_fitted(self, attributes, *args, **kwargs)
+
+    def __sklearn_is_fitted__(self):
+        """This method is called when sklearn's ``check_is_fitted`` is used.
+        
+        Explained here: 
+        https://scikit-learn.org/stable/auto_examples/developing_estimators/sklearn_is_fitted.html
+        """
+        try:
+            self.check_is_fitted()
+        except NotInitializedError:
+            raise NotFittedError(
+                f"This {self.__class__.__name__} instance is not fitted yet. "
+                "Call 'fit' with appropriate arguments before using this estimator."
+            )
+
+    def trim_for_prediction(self):
+        """Remove all attributes not required for prediction.
+
+        Use this method after you finished training your net, with the goal of
+        reducing its size. All attributes only required during training (e.g.
+        the optimizer) are set to None. This can lead to a considerable decrease
+        in memory footprint. It also makes it more likely that the net can be
+        loaded with different library versions.
+
+        After calling this function, the net can only be used for prediction
+        (e.g. ``net.predict`` or ``net.predict_proba``) but no longer for
+        training (e.g. ``net.fit(X, y)`` will raise an exception).
+
+        This operation is irreversible. Once the net has been trimmed for
+        prediction, it is no longer possible to restore the original state.
+        Morevoer, this operation mutates the net. If you need the unmodified
+        net, create a deepcopy before trimming:
+
+        .. code:: python
+
+            from copy import deepcopy
+            net = NeuralNet(...)
+            net.fit(X, y)
+            # training finished
+            net_original = deepcopy(net)
+            net.trim_for_prediction()
+            net.predict(X)
+
+        """
+        # pylint: disable=protected-access
+        if getattr(self, '_trimmed_for_prediction', False):
+            return
+
+        self.check_is_fitted()
+        # pylint: disable=attribute-defined-outside-init
+        self._trimmed_for_prediction = True
+        self._set_training(False)
+
+        if isinstance(self.callbacks, list):
+            self.callbacks.clear()
+        self.callbacks_.clear()
+
+        self.train_split = None
+        self.iterator_train = None
+        self.history.clear()
+
+        attrs_to_trim = self._optimizers[:] + self._criteria[:]
+
+        for name in attrs_to_trim:
+            setattr(self, name + '_', None)
+            if hasattr(self, name):
+                setattr(self, name, None)
 
     def forward_iter(self, X, training=False, device='cpu'):
         """Yield outputs of module forward calls on each batch of data.
@@ -1353,7 +1563,7 @@ class NeuralNet:
 
         """
         x = to_tensor(x, device=self.device)
-        if isinstance(x, dict):
+        if isinstance(x, Mapping):
             x_dict = self._merge_x_and_fit_params(x, fit_params)
             return self.module_(**x_dict)
         return self.module_(x, **fit_params)
@@ -1776,7 +1986,7 @@ class NeuralNet:
         return args, kwargs
 
     def _get_param_names(self):
-        return (k for k in self.__dict__ if not k.endswith('_'))
+        return [k for k in self.__dict__ if not k.endswith('_')]
 
     def _get_params_callbacks(self, deep=True):
         """sklearn's .get_params checks for `hasattr(value,
@@ -1800,7 +2010,7 @@ class NeuralNet:
         return params
 
     def get_params(self, deep=True, **kwargs):
-        params = BaseEstimator.get_params(self, deep=deep, **kwargs)
+        params = super().get_params(deep=deep, **kwargs)
         # Callback parameters are not returned by .get_params, needs
         # special treatment.
         params_cb = self._get_params_callbacks(deep=deep)
@@ -1810,40 +2020,40 @@ class NeuralNet:
         to_exclude = {'_modules', '_criteria', '_optimizers'}
         return {key: val for key, val in params.items() if key not in to_exclude}
 
-    def _check_kwargs(self, kwargs):
+    def _validate_params(self):
         """Check argument names passed at initialization.
+
+        Note: This method is similar to
+        :meth:`sklearn.base.BaseEstimator._validate_params` but doesn't use its
+        machinery.
 
         Raises
         ------
-        TypeError
-          Raises a TypeError if one or more arguments don't seem to
+        ValueError
+          Raises a ValueError if one or more arguments don't seem to
           match or are malformed.
-
-        Returns
-        -------
-        kwargs: dict
-          Return the passed keyword arguments.
 
         Example
         -------
         >>> net = NeuralNetClassifier(MyModule, iterator_train_shuffle=True)
-        TypeError: Got an unexpected argument iterator_train_shuffle,
+        ValueError: Got an unexpected argument iterator_train_shuffle,
         did you mean iterator_train__shuffle?
 
         """
         # warn about usage of iterator_valid__shuffle=True, since this
         # is almost certainly not what the user wants
-        if kwargs.get('iterator_valid__shuffle'):
-            warnings.warn(
-                "You set iterator_valid__shuffle=True; this is most likely not "
-                "what you want because the values returned by predict and "
-                "predict_proba will be shuffled.",
-                UserWarning)
+        if 'iterator_valid__shuffle' in self._params_to_validate:
+            if self.iterator_valid__shuffle:
+                warnings.warn(
+                    "You set iterator_valid__shuffle=True; this is most likely not "
+                    "what you want because the values returned by predict and "
+                    "predict_proba will be shuffled.",
+                    UserWarning)
 
         # check for wrong arguments
         unexpected_kwargs = []
         missing_dunder_kwargs = []
-        for key in kwargs:
+        for key in sorted(self._params_to_validate):
             if key.endswith('_'):
                 continue
 
@@ -1875,11 +2085,16 @@ class NeuralNet:
             suggestion = prefix + '__' + suffix
             msgs.append(tmpl.format(key, suggestion))
 
+        valid_vals_use_caching = ('auto', False, True)
+        if self.use_caching not in valid_vals_use_caching:
+            msgs.append(
+                f"Incorrect value for use_caching used ('{self.use_caching}'), "
+                f"use one of: {', '.join(map(str, valid_vals_use_caching))}"
+            )
+
         if msgs:
             full_msg = '\n'.join(msgs)
-            raise TypeError(full_msg)
-
-        return kwargs
+            raise ValueError(full_msg)
 
     def _check_deprecated_params(self, **kwargs):
         pass
@@ -1903,18 +2118,18 @@ class NeuralNet:
                 virtual_params[key] = val
             elif key.startswith('callbacks'):
                 cb_params[key] = val
-                self._kwargs[key] = val
+                self._params_to_validate.add(key)
             elif any(key.startswith(prefix) for prefix in self.prefixes_):
                 special_params[key] = val
-                self._kwargs[key] = val
+                self._params_to_validate.add(key)
             elif '__' in key:
                 special_params[key] = val
-                self._kwargs[key] = val
+                self._params_to_validate.add(key)
             else:
                 normal_params[key] = val
 
         self._apply_virtual_params(virtual_params)
-        BaseEstimator.set_params(self, **normal_params)
+        super().set_params(**normal_params)
 
         for key, val in special_params.items():
             if key.endswith('_'):
@@ -1938,7 +2153,7 @@ class NeuralNet:
             return self
 
         # if net is initialized, checking kwargs is possible
-        self._check_kwargs(self._kwargs)
+        self._validate_params()
 
         ######################################################
         # Below: Re-initialize parts of the net if necessary #
@@ -1953,7 +2168,7 @@ class NeuralNet:
 
         component_names = {key.split('__', 1)[0] for key in special_params}
         for prefix in component_names:
-            if prefix in self._modules:
+            if (prefix in self._modules) or (prefix == 'compile'):
                 reinit_module = True
                 reinit_criterion = True
                 reinit_optimizer = True
@@ -2045,7 +2260,7 @@ class NeuralNet:
             state.pop(k)
 
         with tempfile.SpooledTemporaryFile() as f:
-            torch.save(cuda_attrs, f)
+            pickle.dump(cuda_attrs, f)
             f.seek(0)
             state['__cuda_dependent_attributes__'] = f.read()
 
@@ -2057,11 +2272,26 @@ class NeuralNet:
         map_location = get_map_location(state['device'])
         load_kwargs = {'map_location': map_location}
         state['device'] = self._check_device(state['device'], map_location)
+        torch_load_kwargs = state.get('torch_load_kwargs') or get_default_torch_load_kwargs()
 
         with tempfile.SpooledTemporaryFile() as f:
+            unpickler = _TorchLoadUnpickler(
+                f,
+                map_location=map_location,
+                torch_load_kwargs=torch_load_kwargs,
+            )
             f.write(state['__cuda_dependent_attributes__'])
             f.seek(0)
-            cuda_attrs = torch.load(f, **load_kwargs)
+            try:
+                cuda_attrs = unpickler.load()
+            except pickle.UnpicklingError:
+                # This object was saved using skorch from before switching to the
+                # custom unpickler, i.e. with torch.save. Fall back to the old loading
+                # code using torch.load. Unfortunately, this means that the user may
+                # get the FutureWarning about weights_only=False. They need to re-save
+                # the net to get rid of the warning
+                f.seek(0)
+                cuda_attrs = torch.load(f, **load_kwargs)
 
         state.update(cuda_attrs)
         state.pop('__cuda_dependent_attributes__')
@@ -2247,6 +2477,7 @@ class NeuralNet:
             f_optimizer=None,
             f_criterion=None,
             f_history=None,
+            use_safetensors=False,
             **kwargs):
         """Saves the module's parameters, history, and optimizer,
         not the whole object.
@@ -2276,6 +2507,13 @@ class NeuralNet:
         f_history : file-like object, str, None (default=None)
           Path to history. Pass ``None`` to not save
 
+        use_safetensors : bool (default=False)
+          Whether to use the ``safetensors`` library to persist the state. By
+          default, PyTorch is used, which in turn uses :mod:`pickle` under the
+          hood. When enabling ``safetensors``, be aware that only PyTorch
+          tensors can be stored. Therefore, certain attributes like the
+          optimizer cannot be saved.
+
         Examples
         --------
         >>> before = NeuralNetClassifier(mymodule)
@@ -2288,6 +2526,28 @@ class NeuralNet:
         ...                   f_history='history.json')
 
         """
+        if use_safetensors:
+            def _save_state_dict(state_dict, f_name):
+                from safetensors.torch import save_file, save
+                try:
+                    if isinstance(f_name, (str, os.PathLike)):
+                        save_file(state_dict, f_name)
+                    else:  # file
+                        as_bytes = save(state_dict)
+                        f_name.write(as_bytes)
+                except ValueError as exc:
+                    msg = (
+                        f"You are trying to store {f_name} using safetensors "
+                        "but there was an error. Safetensors can only store "
+                        "tensors, not generic Python objects (as e.g. optimizer "
+                        "states). If you want to store generic Python objects, "
+                        "don't use safetensors."
+                    )
+                    raise ValueError(msg) from exc
+        else:
+            def _save_state_dict(state_dict, f_name):
+                torch.save(module.state_dict(), f_name)
+
         kwargs_module, kwargs_other = _check_f_arguments(
             'save_params',
             f_params=f_params,
@@ -2315,7 +2575,7 @@ class NeuralNet:
             if attr.endswith('_') and not self.initialized_:
                 self.check_is_fitted([attr], msg=msg_init)
             module = self._get_module(attr, msg=msg_module)
-            torch.save(module.state_dict(), f_name)
+            _save_state_dict(module.state_dict(), f_name)
 
         # only valid key in kwargs_other is f_history
         f_history = kwargs_other.get('f_history')
@@ -2327,6 +2587,15 @@ class NeuralNet:
         return the map device if it differs from the requested device
         along with a warning.
         """
+        if requested_device is None:
+            # user has set net.device=None, we don't know the type, use fallback
+            msg = (
+                f"Setting self.device = {map_device} since the requested device "
+                f"was not specified"
+            )
+            warnings.warn(msg, DeviceWarning)
+            return map_device
+
         type_1 = torch.device(requested_device)
         type_2 = torch.device(map_device)
         if type_1 != type_2:
@@ -2346,6 +2615,7 @@ class NeuralNet:
             f_criterion=None,
             f_history=None,
             checkpoint=None,
+            use_safetensors=False,
             **kwargs):
         """Loads the the module's parameters, history, and optimizer,
         not the whole object.
@@ -2377,6 +2647,13 @@ class NeuralNet:
           path is passed in, the ``f_*`` will be loaded. Pass
           ``None`` to not load.
 
+        use_safetensors : bool (default=False)
+          Whether to use the ``safetensors`` library to load the state. By
+          default, PyTorch is used, which in turn uses :mod:`pickle` under the
+          hood. When the state was saved with ``safetensors=True`` when
+          :meth:`skorch.net.NeuralNet.save_params` was called, it should be set
+          to ``True`` here as well.
+
         Examples
         --------
         >>> before = NeuralNetClassifier(mymodule)
@@ -2389,10 +2666,31 @@ class NeuralNet:
         >>>                   f_history='history.json')
 
         """
-        def _get_state_dict(f):
-            map_location = get_map_location(self.device)
-            self.device = self._check_device(self.device, map_location)
-            return torch.load(f, map_location=map_location)
+        if use_safetensors:
+            def _get_state_dict(f_name):
+                from safetensors import safe_open
+                from safetensors.torch import load
+
+                if isinstance(f_name, (str, os.PathLike)):
+                    state_dict = {}
+                    with safe_open(f_name, framework='pt', device=self.device) as f:
+                        for key in f.keys():
+                            state_dict[key] = f.get_tensor(key)
+                else:
+                    # file
+                    as_bytes = f_name.read()
+                    state_dict = load(as_bytes)
+
+                return state_dict
+        else:
+            torch_load_kwargs = self.torch_load_kwargs
+            if torch_load_kwargs is None:
+                torch_load_kwargs = get_default_torch_load_kwargs()
+
+            def _get_state_dict(f_name):
+                map_location = get_map_location(self.device)
+                self.device = self._check_device(self.device, map_location)
+                return torch.load(f_name, map_location=map_location, **torch_load_kwargs)
 
         kwargs_full = {}
         if checkpoint is not None:

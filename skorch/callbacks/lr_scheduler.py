@@ -9,17 +9,12 @@ import numpy as np
 import torch
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CyclicLR
 from torch.optim.lr_scheduler import ExponentialLR
 from torch.optim.lr_scheduler import LambdaLR
 from torch.optim.lr_scheduler import MultiStepLR
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.optim.lr_scheduler import StepLR
-
-try:
-    from torch.optim.lr_scheduler import CyclicLR as TorchCyclicLR
-except ImportError:
-    # Backward compatibility with torch >= 1.0 && < 1.1
-    TorchCyclicLR = None
 from torch.optim.optimizer import Optimizer
 from skorch.callbacks import Callback
 
@@ -80,7 +75,7 @@ class LRScheduler(Callback):
         self.step_every = step_every
         vars(self).update(kwargs)
 
-    def simulate(self, steps, initial_lr):
+    def simulate(self, steps, initial_lr, step_args=None):
         """
         Simulates the learning rate scheduler.
 
@@ -91,6 +86,13 @@ class LRScheduler(Callback):
 
         initial_lr: float
           Initial learning rate
+
+        step_args: None or float or List[float] (default=None)
+          Argument to the ``.step()`` function of the policy. If it is an
+          indexable object the simulation will try to associate every step of
+          the simulation with an entry in ``step_args``. Scalar values are
+          passed at every step, unchanged. In the default setting (``None``)
+          no additional arguments are passed to ``.step()``.
 
         Returns
         -------
@@ -104,10 +106,15 @@ class LRScheduler(Callback):
         sch = policy_cls(opt, **self.kwargs)
 
         lrs = []
-        for _ in range(steps):
+        for step_idx in range(steps):
             opt.step()  # suppress warning about .step call order
             lrs.append(opt.param_groups[0]['lr'])
-            sch.step()
+            if step_args is None:
+                sch.step()
+            elif hasattr(step_args, '__getitem__'):
+                sch.step(step_args[step_idx])
+            else:
+                sch.step(step_args)
 
         return np.array(lrs)
 
@@ -142,9 +149,61 @@ class LRScheduler(Callback):
             net, self.policy_, **self.kwargs
         )
 
+    def _step(self, net, lr_scheduler, score=None):
+        """Helper method to step the lr scheduler.
+
+        This takes care of two things:
+
+        1. If the lr scheduler is ReduceLROnPlateau, we need to pass the score.
+        2. If the net is uses AccelerateMixin, stepping has to be skipped in
+           certain conditions.
+
+        For more info on the latter, see:
+        https://huggingface.co/docs/accelerate/quicktour#mixed-precision-training
+
+        """
+        accelerator_maybe = getattr(net, 'accelerator', None)
+        accelerator_step_skipped = (
+            accelerator_maybe and accelerator_maybe.optimizer_step_was_skipped
+        )
+        if accelerator_step_skipped:
+            return
+
+        if score is None:
+            lr_scheduler.step()
+        else:
+            lr_scheduler.step(score)
+
+    def _record_last_lr(self, net, kind):
+        # helper function to record the last learning rate if possible;
+        # only record the first lr returned if more than 1 param group
+        if kind not in ('epoch', 'batch'):
+            raise ValueError(f"Argument 'kind' should be 'batch' or 'epoch', get {kind}.")
+
+        if (
+                (self.event_name is None)
+                or not hasattr(self.lr_scheduler_, 'get_last_lr')
+        ):
+            return
+
+        try:
+            last_lrs = self.lr_scheduler_.get_last_lr()
+        except AttributeError:
+            # get_last_lr fails for ReduceLROnPlateau with PyTorch <= 2.2 on 1st epoch.
+            # Take the initial lr instead.
+            last_lrs = [group['lr'] for group in net.optimizer_.param_groups]
+
+        if kind == 'epoch':
+            net.history.record(self.event_name, last_lrs[0])
+        else:
+            net.history.record_batch(self.event_name, last_lrs[0])
+
     def on_epoch_end(self, net, **kwargs):
         if self.step_every != 'epoch':
             return
+
+        self._record_last_lr(net, kind='epoch')
+
         if isinstance(self.lr_scheduler_, ReduceLROnPlateau):
             if callable(self.monitor):
                 score = self.monitor(net)
@@ -158,31 +217,43 @@ class LRScheduler(Callback):
                         "should be placed before the LRScheduler callback"
                     ) from e
 
-            self.lr_scheduler_.step(score)
-            # ReduceLROnPlateau does not expose the current lr so it can't be recorded
+            self._step(net, self.lr_scheduler_, score=score)
         else:
-            if self.event_name is not None and hasattr(
-                    self.lr_scheduler_, "get_last_lr"):
-                net.history.record(self.event_name,
-                                   self.lr_scheduler_.get_last_lr()[0])
-            self.lr_scheduler_.step()
+            self._step(net, self.lr_scheduler_)
 
     def on_batch_end(self, net, training, **kwargs):
         if not training or self.step_every != 'batch':
             return
-        if self.event_name is not None and hasattr(
-                self.lr_scheduler_, "get_last_lr"):
-            net.history.record_batch(self.event_name,
-                                     self.lr_scheduler_.get_last_lr()[0])
-        self.lr_scheduler_.step()
+
+        self._record_last_lr(net, kind='batch')
+
+        if isinstance(self.lr_scheduler_, ReduceLROnPlateau):
+            if callable(self.monitor):
+                score = self.monitor(net)
+            else:
+                try:
+                    score = net.history[-1, 'batches', -1, self.monitor]
+                except KeyError as e:
+                    raise ValueError(
+                        f"'{self.monitor}' was not found in history. A "
+                        f"Scoring callback with name='{self.monitor}' "
+                        "should be placed before the LRScheduler callback"
+                    ) from e
+
+            self._step(net, self.lr_scheduler_, score=score)
+        else:
+            self._step(net, self.lr_scheduler_)
+
         self.batch_idx_ += 1
 
     def _get_scheduler(self, net, policy, **scheduler_kwargs):
         """Return scheduler, based on indicated policy, with appropriate
         parameters.
         """
-        if policy not in [ReduceLROnPlateau] and \
-                'last_epoch' not in scheduler_kwargs:
+        if (
+                (policy not in [ReduceLROnPlateau])
+                and ('last_epoch' not in scheduler_kwargs)
+        ):
             last_epoch = len(net.history) - 1
             scheduler_kwargs['last_epoch'] = last_epoch
 

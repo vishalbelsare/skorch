@@ -199,6 +199,16 @@ class TestToNumpy:
         expected = "Cannot convert this data type to a numpy array."
         assert e.value.args[0] == expected
 
+    @pytest.mark.skipif(
+        not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()),
+        reason='Skipped because mps is not available as a torch backend'
+    )
+    def test_mps_support(self, to_numpy, x_tensor):
+        device = torch.device('mps')
+        x_tensor.to(device)
+        x_numpy = to_numpy(x_tensor)
+        self.compare_array_to_tensor(x_numpy, x_tensor)
+
 
 class TestToDevice:
     @pytest.fixture
@@ -431,6 +441,11 @@ class TestDataFromDataset:
         return X, y
 
     @pytest.fixture
+    def tensors(self, data):
+        X, y = data
+        return torch.from_numpy(X), torch.from_numpy(y)
+
+    @pytest.fixture
     def skorch_ds(self, data):
         from skorch.dataset import Dataset
         return Dataset(*data)
@@ -490,6 +505,24 @@ class TestDataFromDataset:
         X, y = data_from_dataset(subset)
         assert (X == data[0][[1, 3]]).all()
         assert y is None
+
+    def test_with_tensordataset_2_vals(self, data_from_dataset, tensors):
+        dataset = torch.utils.data.dataset.TensorDataset(*tensors)
+        X, y = data_from_dataset(dataset)
+        assert (X == tensors[0]).all()
+        assert (y == tensors[1]).all()
+
+    def test_with_tensordataset_1_val_raises(self, data_from_dataset, tensors):
+        dataset = torch.utils.data.dataset.TensorDataset(tensors[0])
+        msg = "Could not access X and y from dataset."
+        with pytest.raises(AttributeError, match=msg):
+            data_from_dataset(dataset)
+
+    def test_with_tensordataset_3_vals_raises(self, data_from_dataset, tensors):
+        dataset = torch.utils.data.dataset.TensorDataset(*tensors, tensors[0])
+        msg = "Could not access X and y from dataset."
+        with pytest.raises(AttributeError, match=msg):
+            data_from_dataset(dataset)
 
 
 class TestMultiIndexing:

@@ -2,7 +2,6 @@
 
 from contextlib import contextmanager
 from contextlib import suppress
-from distutils.version import LooseVersion
 from functools import partial
 import warnings
 
@@ -10,13 +9,9 @@ import numpy as np
 import sklearn
 from sklearn.metrics import make_scorer, check_scoring
 
-if LooseVersion(sklearn.__version__) >= '0.22':
-    from sklearn.metrics._scorer import _BaseScorer
-else:
-    from sklearn.metrics.scorer import _BaseScorer
-
 from skorch.callbacks import Callback
 from skorch.dataset import unpack_data
+from sklearn.metrics._scorer import _BaseScorer
 from skorch.utils import data_from_dataset
 from skorch.utils import is_skorch_dataset
 from skorch.utils import to_numpy
@@ -28,40 +23,6 @@ __all__ = ['BatchScoring', 'EpochScoring', 'PassthroughScoring']
 
 
 @contextmanager
-def cache_net_infer(net, use_caching, y_preds):
-    """Caching context for ``skorch.NeuralNet`` instance.
-
-    Returns a modified version of the net whose ``infer`` method will
-    subsequently return cached predictions. Leaving the context will
-    undo the overwrite of the ``infer`` method.
-
-    Deprecated.
-
-    """
-
-    warnings.warn(
-        "cache_net_infer is no longer uesd to provide caching for "
-        "the scoring callbacks and will hence be removed in a "
-        "future release.",
-        DeprecationWarning,
-    )
-
-    if not use_caching:
-        yield net
-        return
-    y_preds = iter(y_preds)
-    net.infer = lambda *a, **kw: next(y_preds)
-
-    try:
-        yield net
-    finally:
-        # By setting net.infer we define an attribute `infer`
-        # that precedes the bound method `infer`. By deleting
-        # the entry from the attribute dict we undo this.
-        del net.__dict__['infer']
-
-
-@contextmanager
 def _cache_net_forward_iter(net, use_caching, y_preds):
     """Caching context for ``skorch.NeuralNet`` instance.
 
@@ -69,7 +30,12 @@ def _cache_net_forward_iter(net, use_caching, y_preds):
     method will subsequently return cached predictions. Leaving the
     context will undo the overwrite of the ``forward_iter`` method.
 
+    Note that the net may override the use of caching.
+
     """
+    if net.use_caching != 'auto':
+        use_caching = net.use_caching
+
     if not use_caching:
         yield net
         return
@@ -99,7 +65,7 @@ def convert_sklearn_metric_function(scoring):
 
         # those are scoring objects returned by make_scorer starting
         # from sklearn 0.22
-        scorer_names = ('_PredictScorer', '_ProbaScorer', '_ThresholdScorer')
+        scorer_names = ('_PredictScorer', '_ProbaScorer', '_ThresholdScorer', '_Scorer')
         if (
                 hasattr(module, 'startswith') and
                 module.startswith('sklearn.metrics.') and
@@ -234,7 +200,8 @@ class BatchScoring(ScoringBase):
     use_caching : bool (default=True)
       Re-use the model's prediction for computing the loss to calculate
       the score. Turning this off will result in an additional inference
-      step for each batch.
+      step for each batch. Note that the net may override the use of
+      caching.
 
     """
     # pylint: disable=unused-argument,arguments-differ
@@ -350,7 +317,7 @@ class EpochScoring(ScoringBase):
       in an additional inference step for each epoch and an
       inability to use arbitrary datasets as input (since we
       don't know how to extract ``y_true`` from an arbitrary
-      dataset).
+      dataset). Note that the net may override the use of caching.
 
     """
     def _initialize_cache(self):
@@ -369,7 +336,11 @@ class EpochScoring(ScoringBase):
     # pylint: disable=arguments-differ
     def on_batch_end(
             self, net, batch, y_pred, training, **kwargs):
-        if not self.use_caching or training != self.on_train:
+        use_caching = self.use_caching
+        if net.use_caching !=  'auto':
+            use_caching = net.use_caching
+
+        if (not use_caching) or (training != self.on_train):
             return
 
         # We collect references to the prediction and target data
@@ -384,7 +355,7 @@ class EpochScoring(ScoringBase):
             self.y_trues_.append(y)
         self.y_preds_.append(y_pred)
 
-    def get_test_data(self, dataset_train, dataset_valid):
+    def get_test_data(self, dataset_train, dataset_valid, use_caching):
         """Return data needed to perform scoring.
 
         This is a convenience method that handles picking of
@@ -398,6 +369,9 @@ class EpochScoring(ScoringBase):
 
         dataset_valid
           Incoming validation data or dataset.
+
+        use_caching : bool
+          Whether caching of inference is being used.
 
         Returns
         -------
@@ -418,7 +392,7 @@ class EpochScoring(ScoringBase):
         """
         dataset = dataset_train if self.on_train else dataset_valid
 
-        if self.use_caching:
+        if use_caching:
             X_test = dataset
             y_pred = self.y_preds_
             y_test = [self.target_extractor(y) for y in self.y_trues_]
@@ -464,7 +438,15 @@ class EpochScoring(ScoringBase):
             dataset_train,
             dataset_valid,
             **kwargs):
-        X_test, y_test, y_pred = self.get_test_data(dataset_train, dataset_valid)
+        use_caching = self.use_caching
+        if net.use_caching !=  'auto':
+            use_caching = net.use_caching
+
+        X_test, y_test, y_pred = self.get_test_data(
+            dataset_train,
+            dataset_valid,
+            use_caching=use_caching,
+        )
         if X_test is None:
             return
 

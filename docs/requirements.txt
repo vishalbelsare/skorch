@@ -1,6 +1,9 @@
 docutils<0.18
+gpytorch>=1.5
 numpy>=1.13.3
-https://download.pytorch.org/whl/cpu/torch-1.7.1%2Bcpu-cp37-cp37m-linux_x86_64.whl
+tabulate>=0.7.7
+torch>=1.11.0
+transformers
 sphinx-rtd-theme==0.4.0
 numpydoc==0.8.0
 scikit-learn>=0.19.1

@@ -1,3 +1,6 @@
+.. meta::
+    :keywords: gridsearch
+
 ===
 FAQ
 ===
@@ -59,7 +62,7 @@ skorch supports dicts as input but sklearn doesn't. To get around
 that, try to wrap your dictionary into a :class:`.SliceDict`. This is
 a data container that partly behaves like a dict, partly like an
 ndarray. For more details on how to do this, have a look at the
-coresponding `data section
+corresponding `data section
 <https://nbviewer.jupyter.org/github/skorch-dev/skorch/blob/master/notebooks/Advanced_Usage.ipynb#Working-with-sklearn-FunctionTransformer-and-GridSearch>`__
 in the notebook.
 
@@ -326,6 +329,11 @@ sure that there is an optimization step after the last batch of each
 epoch. However, this example can serve as a starting point to
 implement your own version gradient accumulation.
 
+Alternatively, make use of skorch's `accelerate
+<https://github.com/huggingface/accelerate>`_ integration provided by
+:class:`~skorch.hf.AccelerateMixin` and use the gradient accumulation feature
+from that library.
+
 How can I dynamically set the input size of the PyTorch module based on the data?
 ---------------------------------------------------------------------------------
 
@@ -405,6 +413,56 @@ the **greatest** score.
     best_net = grid_searcher.best_estimator_
     print(best_net.score(X, y))
 
+
+How can I set the random seed of my model?
+------------------------------------------
+
+skorch does not provide a unified way for setting the seed of your model.
+You can utilize the `numpy <https://numpy.org/doc/stable/reference/random/generated/numpy.random.seed.html>`__
+and `torch <https://pytorch.org/docs/stable/generated/torch.manual_seed.html>`__
+seeding interfaces to set random seeds before model initialization and will
+get consistent results if you do not employ other libraries that introduce randomness.
+
+Here's an example:
+
+.. code:: python
+
+    seed = 42
+    numpy.random.seed(seed)
+    torch.manual_seed(seed)
+
+    net = NeuralNet(
+        module=...
+    )
+    net.fit(X, y)
+
+
+Note: `torch.manual_seed` calls `torch.cuda.manual_seed` if the
+current process employs CUDA, so you don't have to worry about
+seeding CUDA RNG explicitly.
+
+There are cases where you want a fixed train/validation split
+(by default the split is not seeded). This can be done by passing
+the `random_state` parameter to `ValidSplit`:
+
+.. code:: python
+
+    from skorch.dataset import ValidSplit
+
+    seed = 42
+    net = NeuralNet(
+        module=...,
+        train_split=ValidSplit(random_state=seed),
+    )
+    net.fit(X, y)
+
+Note that there are other places where randomness is introduced
+that skorch does not control, such as the torch ``DataLoader`` when
+setting ``shuffle=True``. See the corresponding
+`documentation <https://pytorch.org/docs/stable/data.html>`__
+on how to fix the random seed in this case.
+
+
 Migration guide
 ---------------
 
@@ -444,3 +502,42 @@ this is how to make the transition:
         ...
 
 The same goes for the other three methods.
+
+Migration from 0.11 to 0.12
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+In skorch 0.12, we made a change regarding the training step. Now, we initialize
+the :class:`torch.utils.data.DataLoader` only once per fit call instead of once
+per epoch. This is accomplished by calling
+:py:meth:`skorch.net.NeuralNet.get_iterator` only once at the beginning of the
+training process. For the majority of the users, this should make no difference
+in practice.
+
+However, you might be affected if you wrote a custom
+:py:meth:`skorch.net.NeuralNet.run_single_epoch`. The first argument to this
+method is now the initialized ``DataLoader`` instead of a ``Dataset``.
+Therefore, this method should no longer call
+:py:meth:`skorch.net.NeuralNet.get_iterator`. You only need to change a few
+lines of code to accomplish this, as shown below:
+
+.. code:: python
+
+    # before
+    def run_single_epoch(self, dataset, ...):
+        ...
+        for batch in self.get_iterator(dataset, training=training):
+            ...
+
+    # after
+    def run_single_epoch(self, iterator, ...):
+        ...
+        for batch in iterator:
+            ...
+
+Your old code should still work for the time being but will give a
+``DeprecationWarning``. Starting from skorch v0.13, old code will raise an error
+instead.
+
+If it is necessary to have access to the ``Dataset`` inside of
+``run_single_epoch``, you can access it on the ``DataLoader`` object using
+``iterator.dataset``.

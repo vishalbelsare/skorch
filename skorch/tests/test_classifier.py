@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
+from scipy.special import expit
 from sklearn.base import clone
 from torch import nn
 
@@ -88,7 +89,7 @@ class TestNeuralNet:
 
     # classifier-specific test
     def test_takes_no_log_without_nllloss(self, net_cls, module_cls, data):
-        net = net_cls(module_cls, criterion=nn.BCELoss, max_epochs=1)
+        net = net_cls(module_cls, criterion=nn.CrossEntropyLoss, max_epochs=1)
         net.initialize()
 
         mock_loss = Mock(side_effect=nn.NLLLoss())
@@ -133,7 +134,31 @@ class TestNeuralNet:
 
     def test_pass_classes_explicitly_overrides(self, net_cls, module_cls, data):
         net = net_cls(module_cls, max_epochs=0, classes=['foo', 'bar']).fit(*data)
-        assert net.classes_ == ['foo', 'bar']
+        assert (net.classes_ == np.array(['foo', 'bar'])).all()
+
+    def test_classes_are_set_with_tensordataset_explicit_y(
+            self, net_cls, module_cls, data
+    ):
+        # see 990
+        X = torch.from_numpy(data[0])
+        y = torch.arange(len(X)) % 10
+        dataset = torch.utils.data.TensorDataset(X, y)
+        net = net_cls(module_cls, max_epochs=0).fit(dataset, y)
+        assert (net.classes_ == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]).all()
+
+    def test_classes_are_set_with_tensordataset_implicit_y(
+            self, net_cls, module_cls, data
+    ):
+        # see 990
+        from skorch.dataset import ValidSplit
+
+        X = torch.from_numpy(data[0])
+        y = torch.arange(len(X)) % 10
+        dataset = torch.utils.data.TensorDataset(X, y)
+        net = net_cls(
+            module_cls, max_epochs=0, train_split=ValidSplit(3, stratified=False)
+        ).fit(dataset, None)
+        assert (net.classes_ == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]).all()
 
     @pytest.mark.parametrize('classes', [[], np.array([])])
     def test_pass_empty_classes_raises(
@@ -151,6 +176,33 @@ class TestNeuralNet:
         from sklearn.calibration import CalibratedClassifierCV
         cccv = CalibratedClassifierCV(net_fit, cv=2)
         cccv.fit(*data)
+
+    def test_error_when_classes_could_not_be_inferred(self, net_cls, module_cls, data):
+        # Provide a better error message when net.classes_ does not exist,
+        # though it is pretty difficult to know exactly the circumstanes that
+        # led to this, so we have to make a guess.
+        # See https://github.com/skorch-dev/skorch/discussions/1003
+        class MyDataset(torch.utils.data.Dataset):
+            """Dataset class that makes it impossible to access y"""
+            def __len__(self):
+                return len(data[0])
+
+            def __getitem__(self, i):
+                return data[0][i], data[1][i]
+
+        net = net_cls(module_cls, max_epochs=0, train_split=False)
+        ds = MyDataset()
+        net.fit(ds, y=None)
+
+        msg = (
+            "NeuralNetClassifier could not infer the classes from y; "
+            "this error probably occurred because the net was trained without y "
+            "and some function tried to access the '.classes_' attribute; "
+            "a possible solution is to provide the 'classes' argument when "
+            "initializing NeuralNetClassifier"
+        )
+        with pytest.raises(AttributeError, match=msg):
+            net.classes_
 
 
 class TestNeuralNetBinaryClassifier:
@@ -201,7 +253,7 @@ class TestNeuralNetBinaryClassifier:
         clone(net_fit)
 
     @pytest.mark.parametrize('method', INFERENCE_METHODS)
-    def test_not_fitted_raises(self, net_cls, module_cls, data, method):
+    def test_not_init_raises(self, net_cls, module_cls, data, method):
         from skorch.exceptions import NotInitializedError
         net = net_cls(module_cls)
         X = data[0]
@@ -212,6 +264,21 @@ class TestNeuralNetBinaryClassifier:
         msg = ("This NeuralNetBinaryClassifier instance is not initialized "
                "yet. Call 'initialize' or 'fit' with appropriate arguments "
                "before using this method.")
+        assert exc.value.args[0] == msg
+
+    def test_not_fitted_raises(self, net_cls, module_cls):
+        from sklearn.utils.validation import check_is_fitted
+        from sklearn.exceptions import NotFittedError
+    
+        net = net_cls(module_cls)
+        with pytest.raises(NotFittedError) as exc:
+            check_is_fitted(net)
+
+        msg = (
+            "This NeuralNetBinaryClassifier instance is not fitted yet. "
+            "Call 'fit' with appropriate arguments before "
+            "using this estimator."
+        )
         assert exc.value.args[0] == msg
 
     def test_net_learns(self, net_cls, module_cls, data):
@@ -254,6 +321,17 @@ class TestNeuralNetBinaryClassifier:
 
         y_pred_proba = net.predict_proba(X)
         assert y_pred_proba.shape == (X.shape[0], 2)
+
+        # The tests below check that we don't accidentally apply sigmoid twice,
+        # which would result in probabilities constrained to [expit(-1),
+        # expit(1)]. The lower bound is not expit(0), as one may think at first,
+        # because we create the probabilities as:
+        # torch.stack((1 - prob, prob), 1)
+        # So the lowest value that could be achieved by applying sigmoid twice
+        # is 1 - expit(1), which is equal to expit(-1).
+        prob_min, prob_max = expit(-1), expit(1)
+        assert (y_pred_proba < prob_min).any()
+        assert (y_pred_proba > prob_max).any()
 
         y_pred_exp = (y_pred_proba[:, 1] > threshold).astype('uint8')
 
@@ -352,3 +430,47 @@ class TestNeuralNetBinaryClassifier:
         expected = ("Expected module output to have shape (n,) or "
                     "(n, 1), got (128, 2) instead")
         assert msg == expected
+
+    @pytest.fixture(scope='module')
+    def net_with_bceloss(self, net_cls, module_cls, data):
+        # binary classification should also work with BCELoss
+        net = net_cls(
+            module_cls,
+            module__output_nonlin=torch.nn.Sigmoid(),
+            criterion=torch.nn.BCELoss,
+            lr=1,
+        )
+        X, y = data
+        net.fit(X, y)
+        return net
+
+    def test_net_with_bceloss_learns(self, net_with_bceloss):
+        train_losses = net_with_bceloss.history[:, 'train_loss']
+        assert train_losses[0] > 1.3 * train_losses[-1]
+
+    def test_predict_proba_with_bceloss(self, net_with_bceloss, data):
+        X, _ = data
+        y_proba = net_with_bceloss.predict_proba(X)
+
+        assert y_proba.shape == (X.shape[0], 2)
+        assert (y_proba >= 0).all()
+        assert (y_proba <= 1).all()
+
+        # The tests below check that we don't accidentally apply sigmoid twice,
+        # which would result in probabilities constrained to [expit(-1),
+        # expit(1)]. The lower bound is not expit(0), as one may think at first,
+        # because we create the probabilities as:
+        # torch.stack((1 - prob, prob), 1)
+        # So the lowest value that could be achieved by applying sigmoid twice
+        # is 1 - expit(1), which is equal to expit(-1).
+        prob_min, prob_max = expit(-1), expit(1)
+        assert (y_proba < prob_min).any()
+        assert (y_proba > prob_max).any()
+
+    def test_predict_with_bceloss(self, net_with_bceloss, data):
+        X, _ = data
+
+        y_pred_proba = net_with_bceloss.predict_proba(X)
+        y_pred_exp = (y_pred_proba[:, 1] > net_with_bceloss.threshold).astype('uint8')
+        y_pred_actual = net_with_bceloss.predict(X)
+        assert np.allclose(y_pred_exp, y_pred_actual)

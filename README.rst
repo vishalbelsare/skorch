@@ -3,26 +3,26 @@
 
 ------------
 
-|build| |coverage| |docs| |powered|
+|build| |coverage| |docs| |huggingface| |powered|
 
 A scikit-learn compatible neural network library that wraps PyTorch.
 
 .. |build| image:: https://github.com/skorch-dev/skorch/workflows/tests/badge.svg
     :alt: Test Status
-    :scale: 100%
 
 .. |coverage| image:: https://github.com/skorch-dev/skorch/blob/master/assets/coverage.svg
     :alt: Test Coverage
-    :scale: 100%
 
 .. |docs| image:: https://readthedocs.org/projects/skorch/badge/?version=latest
     :alt: Documentation Status
-    :scale: 100%
     :target: https://skorch.readthedocs.io/en/latest/?badge=latest
+
+.. |huggingface| image:: https://github.com/skorch-dev/skorch/actions/workflows/test-hf-integration.yml/badge.svg
+    :alt: Hugging Face Integration
+    :target: https://github.com/skorch-dev/skorch/actions/workflows/test-hf-integration.yml
 
 .. |powered| image:: https://github.com/skorch-dev/skorch/blob/master/assets/powered.svg
     :alt: Powered by
-    :scale: 100%
     :target: https://github.com/ottogroup/
 
 =========
@@ -45,9 +45,7 @@ To see more elaborate examples, look `here
     import numpy as np
     from sklearn.datasets import make_classification
     from torch import nn
-
     from skorch import NeuralNetClassifier
-
 
     X, y = make_classification(1000, 20, n_informative=10, random_state=0)
     X = X.astype(np.float32)
@@ -55,7 +53,7 @@ To see more elaborate examples, look `here
 
     class MyModule(nn.Module):
         def __init__(self, num_units=10, nonlin=nn.ReLU()):
-            super(MyModule, self).__init__()
+            super().__init__()
 
             self.dense0 = nn.Linear(20, num_units)
             self.nonlin = nonlin
@@ -70,7 +68,6 @@ To see more elaborate examples, look `here
             X = self.nonlin(self.dense1(X))
             X = self.softmax(self.output(X))
             return X
-
 
     net = NeuralNetClassifier(
         MyModule,
@@ -90,7 +87,6 @@ In an `sklearn Pipeline <https://scikit-learn.org/stable/modules/generated/sklea
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
 
-
     pipe = Pipeline([
         ('scale', StandardScaler()),
         ('net', net),
@@ -104,7 +100,6 @@ With `grid search <https://scikit-learn.org/stable/modules/generated/sklearn.mod
 .. code:: python
 
     from sklearn.model_selection import GridSearchCV
-
 
     # deactivate skorch-internal train-valid split and verbose logging
     net.set_params(train_split=False, verbose=0)
@@ -129,12 +124,13 @@ skorch also provides many convenient features, among others:
 - `Progress bar <https://skorch.readthedocs.io/en/stable/callbacks.html#skorch.callbacks.ProgressBar>`_ (for CLI as well as jupyter)
 - `Automatic inference of CLI parameters <https://github.com/skorch-dev/skorch/tree/master/examples/cli>`_
 - `Integration with GPyTorch for Gaussian Processes <https://skorch.readthedocs.io/en/latest/user/probabilistic.html>`_
+- `Integration with Hugging Face 🤗 <https://skorch.readthedocs.io/en/stable/user/huggingface.html>`_
 
 ============
 Installation
 ============
 
-skorch requires Python 3.6 or higher.
+skorch requires Python 3.9 or higher.
 
 conda installation
 ==================
@@ -161,7 +157,7 @@ To install with pip, run:
 
 .. code:: bash
 
-    pip install -U skorch
+    python -m pip install -U skorch
 
 Again, we recommend to use a `virtual environment
 <https://docs.python.org/3/tutorial/venv.html>`_ for this.
@@ -181,9 +177,10 @@ To install skorch from source using conda, proceed as follows:
 
     git clone https://github.com/skorch-dev/skorch.git
     cd skorch
-    conda env create
-    source activate skorch
-    pip install .
+    conda create -n skorch-env python=3.12
+    conda activate skorch-env
+    python -m pip install torch
+    python -m pip install .
 
 If you want to help developing, run:
 
@@ -191,12 +188,15 @@ If you want to help developing, run:
 
     git clone https://github.com/skorch-dev/skorch.git
     cd skorch
-    conda env create
-    source activate skorch
-    pip install -e .
+    conda create -n skorch-env python=3.12
+    conda activate skorch-env
+    python -m pip install torch
+    python -m pip install '.[test,docs,dev,extended]'
 
     py.test  # unit tests
     pylint skorch  # static code checks
+
+You may adjust the Python version to any of the supported Python versions.
 
 Using pip
 ---------
@@ -208,9 +208,8 @@ For pip, follow these instructions instead:
     git clone https://github.com/skorch-dev/skorch.git
     cd skorch
     # create and activate a virtual environment
-    pip install -r requirements.txt
     # install pytorch version for your system (see below)
-    pip install .
+    python -m pip install .
 
 If you want to help developing, run:
 
@@ -219,10 +218,8 @@ If you want to help developing, run:
     git clone https://github.com/skorch-dev/skorch.git
     cd skorch
     # create and activate a virtual environment
-    pip install -r requirements.txt
     # install pytorch version for your system (see below)
-    pip install -r requirements-dev.txt
-    pip install -e .
+    python -m pip install -e '.[test,docs,dev,extended]'
 
     py.test  # unit tests
     pylint skorch  # static code checks
@@ -236,24 +233,20 @@ instructions for PyTorch, visit the `PyTorch website
 <http://pytorch.org/>`__. skorch officially supports the last four
 minor PyTorch versions, which currently are:
 
-- 1.6.0
-- 1.7.1
-- 1.8.1
-- 1.9.0
+- 2.5.1
+- 2.6.0
+- 2.7.1
+- 2.8.0
 
 However, that doesn't mean that older versions don't work, just that
 they aren't tested. Since skorch mostly relies on the stable part of
 the PyTorch API, older PyTorch versions should work fine.
 
-In general, running this to install PyTorch should work (assuming CUDA
-11.1):
+In general, running this to install PyTorch should work:
 
 .. code:: bash
 
-    # using conda:
-    conda install pytorch cudatoolkit==11.1 -c pytorch
-    # using pip
-    pip install torch
+    python -m pip install torch
 
 ==================
 External resources
@@ -272,13 +265,19 @@ External resources
   "Skorch: A Union of Scikit learn and PyTorch" at SciPy 2019
 - @thomasjpfan: `talk 3 <https://www.youtube.com/watch?v=yAXsxf2CQ8M>`_
   "Skorch - A Union of Scikit-learn and PyTorch" at PyData 2018
+- @BenjaminBossan: `talk 4 <https://youtu.be/y_n7BjDCS-M>`_ "Extend your
+  scikit-learn workflow with Hugging Face and skorch" at PyData Amsterdam 2023
+  (`slides 4 <https://github.com/BenjaminBossan/presentations/blob/main/2023-09-14-pydata/presentation.org>`_)
 
 =============
 Communication
 =============
 
+- `GitHub discussions <https://github.com/skorch-dev/skorch/discussions>`_: 
+  user questions, thoughts, install issues, general discussions.
+
 - `GitHub issues <https://github.com/skorch-dev/skorch/issues>`_: bug
-  reports, feature requests, install issues, RFCs, thoughts, etc.
+  reports, feature requests, RFCs, etc.
 
 - Slack: We run the #skorch channel on the `PyTorch Slack server
   <https://pytorch.slack.com/>`_, for which you can `request access

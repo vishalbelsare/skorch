@@ -264,12 +264,23 @@ class TestSliceDict:
         )
         assert sldict0 != sldict1
 
+    def test_subclass_getitem_returns_instance_of_itself(self, sldict_cls):
+        class MySliceDict(sldict_cls):
+            pass
+
+        sldict = MySliceDict(a=np.zeros(3))
+        sliced = sldict[:2]
+        assert isinstance(sliced, MySliceDict)
+
 
 class TestSliceDataset:
-    @pytest.fixture(scope='class')
-    def data(self):
+    @pytest.fixture(scope='class', params=['numpy', 'torch'])
+    def data(self, request):
         X, y = make_classification(100, 20, n_informative=10, random_state=0)
-        return X.astype(np.float32), y
+        X = X.astype(np.float32)
+        if request.param == 'numpy':
+            return X, y
+        return torch.from_numpy(X), torch.from_numpy(y)
 
     @pytest.fixture
     def X(self, data):
@@ -323,11 +334,19 @@ class TestSliceDataset:
         [55],
         [-3],
         [0, 10, 3, -8, 3],
-        np.ones(100, dtype=np.bool),
+        np.ones(100, dtype=bool),
         # boolean mask array of length 100
-        np.array([0, 0, 1, 0] * 25, dtype=np.bool),
+        np.array([0, 0, 1, 0] * 25, dtype=bool),
     ])
     def test_len_and_shape_sliced(self, slds, y, sl):
+        # torch tensors don't support negative steps, skip test
+        if (
+                isinstance(sl, slice)
+                and (sl == slice(None, None, -1))
+                and isinstance(y, torch.Tensor)
+        ):
+            return
+
         assert len(slds[sl]) == len(y[sl])
         assert slds[sl].shape == (len(y[sl]),)
 
@@ -355,9 +374,9 @@ class TestSliceDataset:
         (slice(-1, None), 0),
         ([55], -1),
         ([0, 10, 3, -8, 3], 1),
-        (np.ones(100, dtype=np.bool), 5),
+        (np.ones(100, dtype=bool), 5),
         # boolean mask array of length 100
-        (np.array([0, 0, 1, 0] * 25, dtype=np.bool), 6),
+        (np.array([0, 0, 1, 0] * 25, dtype=bool), 6),
     ])
     def test_slice_twice(self, slds_cls, custom_ds, X, y, sl0, sl1, n):
         data = X if n == 0 else y
@@ -370,7 +389,7 @@ class TestSliceDataset:
     @pytest.mark.parametrize('sl0, sl1, sl2', [
         (slice(0, 50), slice(10, 20), 5),
         ([0, 10, 3, -8, 3], [1, 2, 3], 2),
-        (np.ones(100, dtype=np.bool), np.arange(10, 40), 29),
+        (np.ones(100, dtype=bool), np.arange(10, 40), 29),
     ])
     def test_slice_three_times(self, slds_cls, custom_ds, X, y, sl0, sl1, sl2, n):
         data = y if n else X
@@ -380,12 +399,18 @@ class TestSliceDataset:
         assert np.allclose(sliced, x)
 
     def test_explicitly_pass_indices_at_init(self, slds_cls, custom_ds, X):
+        from skorch.utils import to_numpy
         # test passing indices directy to __init__
         slds = slds_cls(custom_ds, indices=np.arange(10))
         sliced0 = slds[5:]
-        assert np.allclose(sliced0, X[5:10])
-
         sliced1 = sliced0[2]
+
+        # comparison method depends on array type
+        if isinstance(sliced1, torch.Tensor):
+            sliced0 = to_numpy(sliced0)
+            sliced1 = to_numpy(sliced1)
+
+        assert np.allclose(sliced0, X[5:10])
         assert np.allclose(sliced1, X[7])
 
     def test_access_element_out_of_bounds(self, slds_cls, custom_ds):
@@ -422,7 +447,9 @@ class TestSliceDataset:
             'lr': [0.01, 0.02],
             'max_epochs': [10, 20],
         }
-        gs = GridSearchCV(net, params, refit=False, cv=3, scoring='accuracy')
+        gs = GridSearchCV(
+            net, params, refit=False, cv=3, scoring='accuracy', error_score='raise'
+        )
         gs.fit(slds, y)  # does not raise
 
     def test_grid_search_with_slds_and_internal_split_works(
@@ -435,7 +462,9 @@ class TestSliceDataset:
             'lr': [0.01, 0.02],
             'max_epochs': [10, 20],
         }
-        gs = GridSearchCV(net, params, refit=True, cv=3, scoring='accuracy')
+        gs = GridSearchCV(
+            net, params, refit=True, cv=3, scoring='accuracy', error_score='raise'
+        )
         gs.fit(slds, y)  # does not raise
 
     def test_grid_search_with_slds_X_and_slds_y(
@@ -452,7 +481,9 @@ class TestSliceDataset:
             'lr': [0.01, 0.02],
             'max_epochs': [10, 20],
         }
-        gs = GridSearchCV(net, params, refit=False, cv=3, scoring='accuracy')
+        gs = GridSearchCV(
+            net, params, refit=False, cv=3, scoring='accuracy', error_score='raise'
+        )
         gs.fit(slds, slds_y)  # does not raise
 
     def test_index_with_2d_array_raises(self, slds):
@@ -464,6 +495,46 @@ class TestSliceDataset:
         msg = ("SliceDataset only supports slicing with 1 "
                "dimensional arrays, got 2 dimensions instead.")
         assert exc.value.args[0] == msg
+
+    @pytest.mark.parametrize('n', [0, 1])
+    def test_slicedataset_to_numpy(self, slds_cls, custom_ds, n):
+        from skorch.utils import to_numpy
+
+        slds = slds_cls(custom_ds, idx=n)
+        expected = custom_ds.X if n == 0 else custom_ds.y
+        result = to_numpy(slds)
+        np.testing.assert_array_equal(result, expected)
+
+    @pytest.mark.parametrize('n', [0, 1])
+    @pytest.mark.parametrize('dtype', [None, np.float16, np.int32, np.complex64])
+    def test_slicedataset_asarray(self, slds_cls, custom_ds, n, dtype):
+        torch_to_numpy_dtype_dict = {
+            torch.int64: np.int64,
+            torch.float32: np.float32,
+        }
+
+        slds = slds_cls(custom_ds, idx=n)
+        array = np.asarray(slds, dtype=dtype)
+        expected = custom_ds.X if n == 0 else custom_ds.y
+        assert array.shape == expected.shape
+
+        if dtype is not None:
+            assert array.dtype == dtype
+        else:
+            # if no dtype indicated, use original dtype of the data, or the
+            # numpy equivalent if a torch dtype
+            expected_dtype = torch_to_numpy_dtype_dict.get(expected.dtype, expected.dtype)
+            assert array.dtype == expected_dtype
+
+    @pytest.mark.parametrize('sl', [slice(0, 2), np.arange(3)])
+    def test_subclass_getitem_returns_instance_of_itself(self, slds_cls, custom_ds, sl):
+        class MySliceDataset(slds_cls):
+            pass
+
+        slds = MySliceDataset(custom_ds, idx=0)
+        sliced = slds[sl]
+
+        assert isinstance(sliced, MySliceDataset)
 
 
 class TestPredefinedSplit():

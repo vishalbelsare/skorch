@@ -1,10 +1,8 @@
 """Tests for lr_scheduler.py"""
-from distutils.version import LooseVersion
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
-import torch
 from sklearn.base import clone
 from torch.optim import SGD
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -13,7 +11,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.optim.lr_scheduler import MultiStepLR
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.optim.lr_scheduler import StepLR
-from torch.optim.lr_scheduler import CyclicLR as TorchCyclicLR
+from torch.optim.lr_scheduler import CyclicLR
 
 from skorch import NeuralNetClassifier
 from skorch.callbacks.lr_scheduler import WarmRestartLR, LRScheduler
@@ -29,13 +27,53 @@ class TestLRCallbacks:
         expected = np.array([1.0, 1.0, 0.1, 0.1, 0.01, 0.01])
         assert np.allclose(expected, lrs)
 
-    @pytest.mark.parametrize('policy', [TorchCyclicLR])
+    @pytest.mark.parametrize('policy', [CyclicLR])
     def test_simulate_lrs_batch_step(self, policy):
         lr_sch = LRScheduler(
             policy, base_lr=1, max_lr=5, step_size_up=4, step_every='batch')
         lrs = lr_sch.simulate(11, 1)
         expected = np.array([1, 2, 3, 4, 5, 4, 3, 2, 1, 2, 3])
         assert np.allclose(expected, lrs)
+
+    def test_simulate_lrs_reduced_lr_on_plateau_scalar(self):
+        # Feed a constant, scalar "loss" to the scheduler.
+        lr_sch = LRScheduler(
+            ReduceLROnPlateau, factor=0.1, patience=1,
+        )
+        lrs = lr_sch.simulate(
+            steps=5, initial_lr=1, step_args=0.5
+        )
+        # O = OK epoch
+        # I = intertolerable epoch
+        #
+        # 1 2 3 4 5   epoch number
+        # O I I I I   epoch classification
+        # 0 1 2 1 2   number of bad epochs
+        #     *   *   epochs with LR reduction
+        #
+        # note that simulate returns the lrs before the step, not after,
+        # so we're seeing only 4 new simulated values.
+        assert all(lrs == [1, 1, 1, 0.1, 0.1])
+
+    def test_simulate_lrs_reduced_lr_on_plateau_array(self):
+        lr_sch = LRScheduler(
+            ReduceLROnPlateau, factor=0.1, patience=1,
+        )
+        metrics = np.array([0.5, 0.4, 0.4, 0.4, 0.3])
+        lrs = lr_sch.simulate(
+            steps=5, initial_lr=1, step_args=metrics
+        )
+        # O = OK epoch
+        # I = intertolerable epoch
+        #
+        # 1 2 3 4 5   epoch number
+        # O O I I O   epoch classification
+        # 0 0 1 2 0   number of bad epochs
+        #       *     epochs with LR reduction
+        #
+        # note that simulate returns the LRs before the step, not after,
+        # so we're seeing only 4 new simulated values.
+        assert all(lrs == [1, 1, 1, 1, 0.1])
 
     @pytest.mark.parametrize('policy, instance, kwargs', [
         ('LambdaLR', LambdaLR, {'lr_lambda': (lambda x: 1e-1)}),
@@ -97,7 +135,7 @@ class TestLRCallbacks:
         assert lr_policy.lr_scheduler_.last_epoch == max_epochs
 
     @pytest.mark.parametrize('policy, kwargs', [
-        (TorchCyclicLR, {'base_lr': 1e-3, 'max_lr': 6e-3, 'step_every': 'batch'}),
+        (CyclicLR, {'base_lr': 1e-3, 'max_lr': 6e-3, 'step_every': 'batch'}),
     ])
     def test_lr_callback_batch_steps_correctly(
             self,
@@ -126,7 +164,7 @@ class TestLRCallbacks:
         assert lr_policy.batch_idx_ == expected
 
     @pytest.mark.parametrize('policy, kwargs', [
-        (TorchCyclicLR, {'base_lr': 1e-3, 'max_lr': 6e-3, 'step_every': 'batch'}),
+        (CyclicLR, {'base_lr': 1e-3, 'max_lr': 6e-3, 'step_every': 'batch'}),
     ])
     def test_lr_callback_batch_steps_correctly_fallback(
             self,
@@ -178,7 +216,7 @@ class TestLRCallbacks:
 
     def test_lr_scheduler_set_params(self, classifier_module, classifier_data):
         scheduler = LRScheduler(
-            TorchCyclicLR, base_lr=123, max_lr=999, step_every='batch')
+            CyclicLR, base_lr=123, max_lr=999, step_every='batch')
         net = NeuralNetClassifier(
             classifier_module,
             max_epochs=0,
@@ -191,10 +229,6 @@ class TestLRCallbacks:
     @pytest.mark.parametrize('policy,kwargs', [
         (StepLR, {'gamma': 0.9, 'step_size': 1})
     ])
-    @pytest.mark.skipif(
-        LooseVersion(torch.__version__) < '1.4',
-        reason="Feature isn't supported with this torch version."
-    )
     def test_lr_scheduler_record_epoch_step(self,
                                             classifier_module,
                                             classifier_data,
@@ -212,16 +246,12 @@ class TestLRCallbacks:
         net.fit(*classifier_data)
         assert np.all(net.history[:, 'event_lr'] == lrs)
 
-    @pytest.mark.skipif(
-        LooseVersion(torch.__version__) < '1.4',
-        reason="Feature isn't supported with this torch version."
-    )
     def test_lr_scheduler_record_batch_step(self, classifier_module, classifier_data):
         X, y = classifier_data
         batch_size = 128
 
         scheduler = LRScheduler(
-            TorchCyclicLR,
+            CyclicLR,
             base_lr=1,
             max_lr=5,
             step_size_up=4,
@@ -324,6 +354,55 @@ class TestReduceLROnPlateau:
                "LRScheduler callback")
         with pytest.raises(ValueError, match=msg):
             net.fit(X, y)
+
+    def test_reduce_lr_record_epoch_step(self, classifier_module, classifier_data):
+        epochs = 10 * 3  # patience = 10, get 3 full cycles of lr reduction
+        lr = 123.
+        net = NeuralNetClassifier(
+            classifier_module,
+            max_epochs=epochs,
+            lr=lr,
+            callbacks=[
+                ('scheduler', LRScheduler(ReduceLROnPlateau, monitor='train_loss')),
+            ],
+        )
+        net.fit(*classifier_data)
+
+        # We cannot compare lrs to simulation data, as ReduceLROnPlateau cannot be
+        # simulated. Instead we expect the lr to be reduced by a factor of 10 every
+        # 10+ epochs (as patience = 10), with the exact number depending on the training
+        # progress. Therefore, we can have at most 3 distinct lrs, but it could be less,
+        # so we need to slice the expected lrs.
+        lrs = net.history[:, 'event_lr']
+        lrs_unique = np.unique(lrs)
+        expected = np.unique([123., 12.3, 1.23])[-len(lrs_unique):]
+        assert np.allclose(lrs_unique, expected)
+
+    def test_reduce_lr_record_batch_step(self, classifier_module, classifier_data):
+        epochs = 3
+        lr = 123.
+        net = NeuralNetClassifier(
+            classifier_module,
+            max_epochs=epochs,
+            lr=lr,
+            callbacks=[
+                ('scheduler', LRScheduler(
+                    ReduceLROnPlateau, monitor='train_loss', step_every='batch'
+                )),
+            ],
+        )
+        net.fit(*classifier_data)
+
+        # We cannot compare lrs to simulation data, as ReduceLROnPlateau cannot be
+        # simulated. Instead we expect the lr to be reduced by a factor of 10 every
+        # 10+ batches (as patience = 10), with the exact number depending on the
+        # training progress. Therefore, we can have at most 3 distinct lrs, but it
+        # could be less, so we need to slice the expected, lrs.
+        lrs_nested = net.history[:, 'batches', :, 'event_lr']
+        lrs_flat = sum(lrs_nested, [])
+        lrs_unique = np.unique(lrs_flat)
+        expected = np.unique([123., 12.3, 1.23])[-len(lrs_unique):]
+        assert np.allclose(lrs_unique, expected)
 
 
 class TestWarmRestartLR():

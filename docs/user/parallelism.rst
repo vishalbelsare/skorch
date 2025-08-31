@@ -5,7 +5,7 @@ Parallelism
 Skorch supports distributing work among a cluster of workers via
 `dask.distributed <http://distributed.readthedocs.io>`_.  In this
 section we'll describe how to use Dask to efficiently distribute a
-grid search or a randomized search on hyperparamerers across multiple
+grid search or a randomized search on hyperparameters across multiple
 GPUs and potentially multiple hosts.
 
 Let's assume that you have two GPUs that you want to run a hyper
@@ -19,9 +19,9 @@ up Dask workers that, using this environment variable, each see one
 GPU only.  On the PyTorch side, we'll have to make sure to set the
 device to ``cuda`` when we initialize the :class:`.NeuralNet` class.
 
-Let's run through the steps.  First, install Dask and dask.distrubted::
+Let's run through the steps.  First, install Dask and dask.distributed::
 
-  pip install dask distributed
+  python -m pip install dask distributed
 
 Next, assuming you have two GPUs on your machine, let's start up a
 Dask scheduler and two Dask workers.  Make sure the Dask workers are
@@ -35,7 +35,7 @@ packages required to do the work::
 In your code, use joblib's :func:`~joblib.parallel_backend` context
 manager to activate the Dask backend when you run grid searches and
 the like.  Also instantiate a :class:`dask.distributed.Client` to
-point to the Dask scheduler that you want to use.  Let's see how this
+point to the Dask scheduler that you want to use.  Let's see what this
 could look like:
 
 .. code:: python

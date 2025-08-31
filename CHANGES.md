@@ -8,11 +8,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Added `load_best` attribute to `EarlyStopping` callback to automatically load module weights of the best result at the end of training
 
 ### Changed
 
 ### Fixed
+
+- Implement `__sklearn_is_fitted__` for skorch models, following [sklearn custom model protocol](https://scikit-learn.org/stable/auto_examples/developing_estimators/sklearn_is_fitted.html#sphx-glr-auto-examples-developing-estimators-sklearn-is-fitted-py) (#1119)
+
+## [1.2.0]
+
+### Added
+
+- Add Contributing Guidelines for skorch. (#1097)
+- Add an example of hyper-parameter optimization using [Optuna](https://optuna.org/) [here](https://github.com/skorch-dev/skorch/tree/master/examples/optuna) (#1098)
+- Add Example for Streaming Dataset(#1105)
+- Add pyproject.toml to Improve CI/CD and Tooling (#1108)
+
+### Changed
+
+- Loading of skorch nets using pickle: When unpickling a skorch net, you may come across a PyTorch warning that goes: "FutureWarning: You are using torch.load with weights_only=False [...]"; to avoid this warning, pickle the net again and use the new pickle file (#1092)
+
+### Fixed
+
+## [1.1.0]
+
+### Added
+
+- Added a [notebook](https://github.com/skorch-dev/skorch/blob/master/notebooks/Learning_Rate_Scheduler.ipynb) that shows how to use Learning Rate Scheduler in skorch.(#1074)
+
+### Changed
+
+- All neural net classes now inherit from sklearn's [`BaseEstimator`](https://scikit-learn.org/stable/modules/generated/sklearn.base.BaseEstimator.html). This is to support compatibility with sklearn 1.6.0 and above. Classification models additionally inherit from [`ClassifierMixin`](https://scikit-learn.org/stable/modules/generated/sklearn.base.ClassifierMixin.html) and regressors from [`RegressorMixin`](https://scikit-learn.org/stable/modules/generated/sklearn.base.RegressorMixin.html). (#1078)
+- When using the `ReduceLROnPlateau` learning rate scheduler, we now record the learning rate in the net history (`net.history[:, 'event_lr']` by default). It is now also possible to to step per batch, not only by epoch (#1075)
+- The learning rate scheduler `.simulate()` method now supports adding step args which is useful when simulation policies such as `ReduceLROnPlateau` which expect metrics to base their schedule on. (#1077)
+- Removed deprecated `skorch.callbacks.scoring.cache_net_infer` (#1088)
+
+### Fixed
+
+- Fix an issue with using `NeuralNetBinaryClassifier` with `torch.compile` (#1058)
+
+## [1.0.0] - 2024-05-27
+
+The 1.0.0 release of skorch is here. We think that skorch is at a very stable point, which is why a 1.0.0 release is appropriate. There are no plans to add any breaking changes or major revisions in the future. Instead, our focus now is to keep skorch up-to-date with the latest versions of PyTorch and scikit-learn, and to fix any bugs that may arise.
+
+## [0.15.0] - 2023-09-04
+
+### Added
+- Add the option to globally override the use of caching in scoring callbacks on the net by setting the `use_caching` argument on the net (this overrides the settings of individual callbacks) (#971)
+- Add support for saving and loading parameters with [safetensors](https://github.com/huggingface/safetensors/); use `net.save_params(..., use_safetensors=True)` and `net.load_params(..., use_safetensors=True)` (requires to install the `safetensors` library) (#970)
+
+### Changed
+- Nets pickled with skorch version 0.11 can no longer be loaded in version 0.15 (see #880); to transition these nets, pickle them in a skorch version between 0.12 and 0.14, then load them in 0.15
+
+### Fixed
+
+- Fixed a couple of issues when saving and loading parameters while using accelerate (via `AccelerateMixin`) in a multi-GPU setting, and some other minor accelerate issues (#1008, #1009)
+- Installing skorch with the `[testing]` option now installs all dev requirements (#1015)
+
+## [0.14.0] - 2023-06-24
+
+### Added
+
+- Add version logging to `NeptuneLogger` callback (#964)
+- Add support for [zero-shot and few-shot classification](https://skorch.readthedocs.io/en/latest/user/llm.html#using-language-models-as-zero-and-few-shot-classifiers) with the help of Large Language Models and the Hugging Face transformers library
+
+### Changed
+- Moved from `pkg_resources` to `importlib` and subsequently dropping support for Python 3.7
+  as PyTorch moved dropped support and the version itself hit EOL (#928 and #983)
+
+- `NeuralNetRegressor` can now be fitted with 1-dimensional `y`, which is necessary in some specific circumstances (e.g. in conjunction with sklearn's `BaggingRegressor`, see #972); for this to work correctly, the output of the of the PyTorch module should also be 1-dimensional; the existing default, i.e. having `y` and `y_pred` be 2-dimensional, remains the recommended way of using `NeuralNetRegressor`
+
+### Fixed
+
+## [0.13.0] - 2023-05-17
+
+### Added
+- Add support for compiled PyTorch modules using the `torch.compile` function, introduced in [PyTorch 2.0 release](https://pytorch.org/get-started/pytorch-2.0/), which can greatly improve performance on new GPU architectures; to use it, initialize your net with the `compile=True` argument, further compilation arguments can be specified using the dunder notation, e.g. `compile__dynamic=True`
+- Add a class [`DistributedHistory`](https://skorch.readthedocs.io/en/latest/history.html#skorch.history.DistributedHistory) which should be used when training in a multi GPU setting (#955)
+- `SkorchDoctor`: A helper class that assists in understanding and debugging the neural net training, see [this notebook](https://nbviewer.org/github/skorch-dev/skorch/blob/master/notebooks/Skorch_Doctor.ipynb) (#912)
+- When using `AccelerateMixin`, it is now possible to prevent unwrapping of the modules by setting `unwrap_after_train=True` (#963)
+
+### Changed
+
+### Fixed
+- Fixed install command to work with recent changes in Google Colab (#928)
+- Fixed a couple of bugs related to using non-default modules and criteria (#927)
+- Fixed a bug when using `AccelerateMixin` in a multi-GPU setup (#947)
+- `_get_param_names` returns a list instead of a generator so that subsequent
+  error messages return useful information instead of a generator `repr`
+  string (#925)
+- Fixed a bug that caused modules to not be sufficiently unwrapped at the end of training when using `AccelerateMixin`, which could prevent them from being pickleable (#963)
+
+## [0.12.1] - 2022-11-18
+
+### Changed
+
+- `NeptuneLogger` was updated to work with recent versions of Neptune client (v0.14.3 or higher); it now logs some additional data, including the model summary, configuration, and learning rate (when available) (#906)
+
+### Fixed
+
+- Fixed an error that could occur with specific combinations of gpytorch and PyTorch versions (#913)
+
+## [0.12.0] - 2022-10-07
+
+### Added
+- Added `load_best` attribute to `EarlyStopping` callback to automatically load module weights of the best result at the end of training
+- Added a method, `trim_for_prediction`, on the net classes, which trims the net from everything not required for using it for prediction; call this after fitting to reduce the size of the net
+- Added experimental support for [huggingface accelerate](https://github.com/huggingface/accelerate); use the provided mixin class to add advanced training capabilities provided by the accelerate library to skorch
+- Add integration for Huggingface tokenizers; use `skorch.hf.HuggingfaceTokenizer` to train a Huggingface tokenizer on your custom data; use `skorch.hf.HuggingfacePretrainedTokenizer` to load a pre-trained Huggingface tokenizer
+- Added support for creating model checkpoints on Hugging Face Hub using [`HfHubStorage`](https://skorch.readthedocs.io/en/latest/hf.html#skorch.hf.HfHubStorage)
+- Added a [notebook](https://nbviewer.org/github/skorch-dev/skorch/blob/master/notebooks/CORA-geometric.ipynb) that shows how to use skorch with PyTorch Geometric (#863)
+
+### Changed
+- The minimum required scikit-learn version has been bumped to 0.22.0
+- Initialize data loaders for training and validation dataset once per fit call instead of once per epoch ([migration guide](https://skorch.readthedocs.io/en/stable/user/FAQ.html#migration-from-0-11-to-0-12))
+- It is now possible to call `np.asarray` with `SliceDataset`s (#858)
+
+### Fixed
+- Fixed a bug in `SliceDataset` that prevented it to be used with `to_numpy` (#858)
+- Fixed a bug that occurred when loading a net that has device set to None (#876)
+- Fixed a bug that in some cases could prevent loading a net that was trained with CUDA without CUDA
+- Enable skorch to work on M1/M2 Apple MacBooks (#884)
 
 ## [0.11.0] - 2021-10-11
 
@@ -263,3 +379,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.9.0]: https://github.com/skorch-dev/skorch/compare/v0.8.0...v0.9.0
 [0.10.0]: https://github.com/skorch-dev/skorch/compare/v0.9.0...v0.10.0
 [0.11.0]: https://github.com/skorch-dev/skorch/compare/v0.10.0...v0.11.0
+[0.12.0]: https://github.com/skorch-dev/skorch/compare/v0.11.0...v0.12.0
+[0.12.1]: https://github.com/skorch-dev/skorch/compare/v0.12.0...v0.12.1
+[0.13.0]: https://github.com/skorch-dev/skorch/compare/v0.12.1...v0.13.0
+[0.14.0]: https://github.com/skorch-dev/skorch/compare/v0.13.0...v0.14.0
+[0.15.0]: https://github.com/skorch-dev/skorch/compare/v0.14.0...v0.15.0
+[1.0.0]: https://github.com/skorch-dev/skorch/compare/v0.15.0...v1.0.0
+[1.1.0]: https://github.com/skorch-dev/skorch/compare/v1.0.0...v1.1.0

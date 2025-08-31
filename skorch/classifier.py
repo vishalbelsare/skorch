@@ -1,6 +1,7 @@
 """NeuralNet subclasses for classification tasks."""
 
 import re
+import textwrap
 
 import numpy as np
 from sklearn.base import ClassifierMixin
@@ -13,8 +14,7 @@ from skorch.callbacks import PrintLog
 from skorch.callbacks import EpochScoring
 from skorch.callbacks import PassthroughScoring
 from skorch.dataset import ValidSplit
-from skorch.utils import get_dim, to_numpy
-from skorch.utils import is_dataset
+from skorch.utils import data_from_dataset, is_dataset, get_dim, to_numpy
 
 neural_net_clf_doc_start = """NeuralNet for classification tasks
 
@@ -36,23 +36,25 @@ neural_net_clf_additional_text = """
       skorch behavior should be restored, i.e. raising an
       ``AttributeError``, pass an empty list."""
 
-neural_net_clf_additional_attribute = """classes_ : array, shape (n_classes, )
+neural_net_clf_additional_attribute = """    classes_ : array, shape (n_classes, )
       A list of class labels known to the classifier.
 
 """
 
-
 def get_neural_net_clf_doc(doc):
-    doc = neural_net_clf_doc_start + " " + doc.split("\n ", 4)[-1]
-    pattern = re.compile(r'(\n\s+)(criterion .*\n)(\s.+){1,99}')
+    indentation = "    "
+    # dedent/indent roundtrip required for consistent indention in both
+    # Python <3.13 and Python >=3.13
+    # Because <3.13 => not automatic dedent, but it is the case in >=3.13
+    doc = neural_net_clf_doc_start + " " + textwrap.indent(textwrap.dedent(doc.split("\n", 5)[-1]), indentation)
+    pattern = re.compile(r'(\n\s+)(criterion .*\n)(\s.+|.){1,99}')
     start, end = pattern.search(doc).span()
     doc = doc[:start] + neural_net_clf_additional_text + doc[end:]
     doc = doc + neural_net_clf_additional_attribute
     return doc
 
-
 # pylint: disable=missing-docstring
-class NeuralNetClassifier(NeuralNet, ClassifierMixin):
+class NeuralNetClassifier(ClassifierMixin, NeuralNet):
     __doc__ = get_neural_net_clf_doc(NeuralNet.__doc__)
 
     def __init__(
@@ -98,8 +100,22 @@ class NeuralNetClassifier(NeuralNet, ClassifierMixin):
             if not len(self.classes):
                 raise AttributeError("{} has no attribute 'classes_'".format(
                     self.__class__.__name__))
-            return self.classes
-        return self.classes_inferred_
+            return np.asarray(self.classes)
+
+        try:
+            return self.classes_inferred_
+        except AttributeError as exc:
+            # It's not easily possible to track exactly what circumstances led
+            # to this, so try to make an educated guess and provide a possible
+            # solution.
+            msg = (
+                f"{self.__class__.__name__} could not infer the classes from y; "
+                "this error probably occurred because the net was trained without y "
+                "and some function tried to access the '.classes_' attribute; "
+                "a possible solution is to provide the 'classes' argument when "
+                f"initializing {self.__class__.__name__}"
+            )
+            raise AttributeError(msg) from exc
 
     # pylint: disable=signature-differs
     def check_data(self, X, y):
@@ -114,12 +130,23 @@ class NeuralNetClassifier(NeuralNet, ClassifierMixin):
                    "``iterator_train`` and ``iterator_valid`` parameters "
                    "respectively.")
             raise ValueError(msg)
+
+        if (y is None) and is_dataset(X):
+            try:
+                _, y_ds = data_from_dataset(X)
+                self.classes_inferred_ = np.unique(to_numpy(y_ds))
+            except AttributeError:
+                # If this fails, we might still be good to go, so don't raise
+                pass
+
         if y is not None:
             # pylint: disable=attribute-defined-outside-init
             self.classes_inferred_ = np.unique(to_numpy(y))
 
     # pylint: disable=arguments-differ
     def get_loss(self, y_pred, y_true, *args, **kwargs):
+        # we can assume that the attribute criterion_ exists; if users define
+        # custom criteria, they have to override get_loss anyway
         if isinstance(self.criterion_, torch.nn.NLLLoss):
             eps = torch.finfo(y_pred.dtype).eps
             y_pred = torch.log(y_pred + eps)
@@ -225,16 +252,18 @@ neural_net_binary_clf_criterion_text = """
       Probabilities above this threshold is classified as 1. ``threshold``
       is used by ``predict`` and ``predict_proba`` for classification."""
 
-
 def get_neural_net_binary_clf_doc(doc):
-    doc = neural_net_binary_clf_doc_start + " " + doc.split("\n ", 4)[-1]
-    pattern = re.compile(r'(\n\s+)(criterion .*\n)(\s.+){1,99}')
+    indentation = "    "
+    # dedent/indent roundtrip required for consistent indention in both
+    # Python <3.13 and Python >=3.13
+    # Because <3.13 => not automatic dedent, but it is the case in >=3.13
+    doc = neural_net_binary_clf_doc_start + " " + textwrap.indent(textwrap.dedent(doc.split("\n", 5)[-1]), indentation)
+    pattern = re.compile(r'(\n\s+)(criterion .*\n)(\s.+|.){1,99}')
     start, end = pattern.search(doc).span()
     doc = doc[:start] + neural_net_binary_clf_criterion_text + doc[end:]
     return doc
 
-
-class NeuralNetBinaryClassifier(NeuralNet, ClassifierMixin):
+class NeuralNetBinaryClassifier(ClassifierMixin, NeuralNet):
     # pylint: disable=missing-docstring
     __doc__ = get_neural_net_binary_clf_doc(NeuralNet.__doc__)
 
@@ -277,7 +306,7 @@ class NeuralNetBinaryClassifier(NeuralNet, ClassifierMixin):
 
     @property
     def classes_(self):
-        return [0, 1]
+        return np.array([0, 1])
 
     # pylint: disable=signature-differs
     def check_data(self, X, y):

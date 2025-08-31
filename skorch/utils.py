@@ -4,19 +4,23 @@ Should not have any dependency on other skorch packages.
 
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
-from distutils.version import LooseVersion
 from enum import Enum
 from functools import partial
+import io
 from itertools import tee
 import pathlib
+import pickle
 import warnings
 
 import numpy as np
 from scipy import sparse
-import sklearn
+from sklearn.exceptions import NotFittedError
+from sklearn.utils import _safe_indexing as safe_indexing
+from sklearn.utils.validation import check_is_fitted as sk_check_is_fitted
 import torch
+from torch.nn import BCELoss
 from torch.nn import BCEWithLogitsLoss
 from torch.nn import CrossEntropyLoss
 from torch.nn.utils.rnn import PackedSequence
@@ -24,18 +28,13 @@ from torch.utils.data.dataset import Subset
 
 from skorch.exceptions import DeviceWarning
 from skorch.exceptions import NotInitializedError
+from ._version import Version
 
-if LooseVersion(sklearn.__version__) >= '0.22.0':
-    from sklearn.utils import _safe_indexing as safe_indexing
-else:
-    from sklearn.utils import safe_indexing
-
-GPYTORCH_INSTALLED = False
 try:
-    import gpytorch
-    GPYTORCH_INSTALLED = True
+    import torch_geometric
+    TORCH_GEOMETRIC_INSTALLED = True
 except ImportError:
-    gpytorch = None
+    TORCH_GEOMETRIC_INSTALLED = False
 
 
 class Ansi(Enum):
@@ -54,6 +53,11 @@ def is_torch_data_type(x):
 
 def is_dataset(x):
     return isinstance(x, torch.utils.data.Dataset)
+
+
+def is_geometric_data_type(x):
+    from torch_geometric.data import Data
+    return isinstance(x, Data)
 
 
 # pylint: disable=not-callable
@@ -90,7 +94,12 @@ def to_tensor(X, device, accept_sparse=False):
 
     if is_torch_data_type(X):
         return to_device(X, device)
-    if isinstance(X, dict):
+    if TORCH_GEOMETRIC_INSTALLED and is_geometric_data_type(X):
+        return to_device(X, device)
+    if hasattr(X, 'convert_to_tensors'):
+        # huggingface transformers BatchEncoding
+        return X.convert_to_tensors('pt')
+    if isinstance(X, Mapping):
         return {key: to_tensor_(val) for key, val in X.items()}
     if isinstance(X, (list, tuple)):
         return [to_tensor_(x) for x in X]
@@ -110,6 +119,11 @@ def to_tensor(X, device, accept_sparse=False):
     raise TypeError("Cannot convert this data type to a torch tensor.")
 
 
+def _is_slicedataset(X):
+    # Cannot use isinstance because we don't want to depend on helper.py.
+    return hasattr(X, 'dataset') and hasattr(X, 'idx') and hasattr(X, 'indices')
+
+
 def to_numpy(X):
     """Generic function to convert a pytorch tensor to numpy.
 
@@ -123,7 +137,7 @@ def to_numpy(X):
     if isinstance(X, np.ndarray):
         return X
 
-    if isinstance(X, dict):
+    if isinstance(X, Mapping):
         return {key: to_numpy(val) for key, val in X.items()}
 
     if is_pandas_ndframe(X):
@@ -132,10 +146,16 @@ def to_numpy(X):
     if isinstance(X, (tuple, list)):
         return type(X)(to_numpy(x) for x in X)
 
+    if _is_slicedataset(X):
+        return np.asarray(X)
+
     if not is_torch_data_type(X):
         raise TypeError("Cannot convert this data type to a numpy array.")
 
     if X.is_cuda:
+        X = X.cpu()
+
+    if hasattr(X, 'is_mps') and X.is_mps:
         X = X.cpu()
 
     if X.requires_grad:
@@ -169,8 +189,9 @@ def to_device(X, device):
     if device is None:
         return X
 
-    if isinstance(X, dict):
-        return {key: to_device(val, device) for key, val in X.items()}
+    if isinstance(X, Mapping):
+        # dict-like but not a dict
+        return type(X)({key: to_device(val, device) for key, val in X.items()})
 
     # PackedSequence class inherits from a namedtuple
     if isinstance(X, (tuple, list)) and (type(X) != PackedSequence):
@@ -200,7 +221,7 @@ def is_pandas_ndframe(x):
 
 def flatten(arr):
     for item in arr:
-        if isinstance(item, (tuple, list, dict)):
+        if isinstance(item, (tuple, list, Mapping)):
             yield from flatten(item)
         else:
             yield item
@@ -257,7 +278,7 @@ def check_indexing(data):
     if data is None:
         return _indexing_none
 
-    if isinstance(data, dict):
+    if isinstance(data, Mapping):
         # dictionary of containers
         return _indexing_dict
 
@@ -420,6 +441,11 @@ def data_from_dataset(dataset, X_indexing=None, y_indexing=None):
       If not None, use this function for indexing into the y data. If
       None, try to automatically determine how to index data.
 
+    Raises
+    ------
+    AttributeError
+      If X and y could not be accessed from the dataset.
+
     """
     X, y = _none, _none
 
@@ -430,6 +456,9 @@ def data_from_dataset(dataset, X_indexing=None, y_indexing=None):
         y = multi_indexing(y, dataset.indices, indexing=y_indexing)
     elif hasattr(dataset, 'X') and hasattr(dataset, 'y'):
         X, y = dataset.X, dataset.y
+    elif isinstance(dataset, torch.utils.data.dataset.TensorDataset):
+        if len(items := dataset.tensors) == 2:
+            X, y = items
 
     if (X is _none) or (y is _none):
         raise AttributeError("Could not access X and y from dataset.")
@@ -458,14 +487,15 @@ def noop(*args, **kwargs):
 @contextmanager
 def open_file_like(f, mode):
     """Wrapper for opening a file"""
-    new_fd = isinstance(f, (str, pathlib.Path))
-    if new_fd:
-        f = open(f, mode)
+    if isinstance(f, (str, pathlib.Path)):
+        file_like = open(f, mode)
+    else:
+        file_like = f
+
     try:
-        yield f
+        yield file_like
     finally:
-        if new_fd:
-            f.close()
+        file_like.close()
 
 
 # pylint: disable=unused-argument
@@ -545,7 +575,7 @@ def get_map_location(target_device, fallback_device='cpu'):
     return map_location
 
 
-def check_is_fitted(estimator, attributes, msg=None, all_or_any=all):
+def check_is_fitted(estimator, attributes=None, msg=None, all_or_any=all):
     """Checks whether the net is initialized.
 
     Note: This calls ``sklearn.utils.validation.check_is_fitted``
@@ -555,21 +585,32 @@ def check_is_fitted(estimator, attributes, msg=None, all_or_any=all):
     an ``sklearn.exceptions.NotFittedError``.
 
     """
-    if msg is None:
-        msg = ("This %(name)s instance is not initialized yet. Call "
-               "'initialize' or 'fit' with appropriate arguments "
-               "before using this method.")
+    try:
+        sk_check_is_fitted(estimator, attributes, msg=msg, all_or_any=all_or_any)
+    except NotFittedError as exc:
+        if msg is None:
+            msg = ("This %(name)s instance is not initialized yet. Call "
+                   "'initialize' or 'fit' with appropriate arguments "
+                   "before using this method.")
 
-    if not isinstance(attributes, (list, tuple)):
-        attributes = [attributes]
-
-    if not all_or_any([hasattr(estimator, attr) for attr in attributes]):
-        raise NotInitializedError(msg % {'name': type(estimator).__name__})
+        raise NotInitializedError(msg % {'name': type(estimator).__name__}) from exc
 
 
 def _identity(x):
     """Return input as is, the identity operation"""
     return x
+
+
+def _make_2d_probs(prob):
+    """Create a 2d probability array from a 1d vector
+
+    This is needed because by convention, even for binary classification
+    problems, sklearn expects 2 probabilities to be returned per row, one for
+    class 0 and one for class 1.
+
+    """
+    y_proba = torch.stack((1 - prob, prob), 1)
+    return y_proba
 
 
 def _sigmoid_then_2d(x):
@@ -594,8 +635,7 @@ def _sigmoid_then_2d(x):
 
     """
     prob = torch.sigmoid(x)
-    y_proba = torch.stack((1 - prob, prob), 1)
-    return y_proba
+    return _make_2d_probs(prob)
 
 
 # TODO only needed if multiclass GP classfication is added
@@ -603,6 +643,7 @@ def _sigmoid_then_2d(x):
     # return x.T
 
 
+# pylint: disable=protected-access
 def _infer_predict_nonlinearity(net):
     """Infers the correct nonlinearity to apply for this net
 
@@ -615,7 +656,13 @@ def _infer_predict_nonlinearity(net):
     # based on the criterion, not the class of the net. We still pass
     # the whole net as input in case we want to modify this at a
     # future point in time.
-    criterion = net.criterion_
+    if len(net._criteria) != 1:
+        # don't know which criterion to consider, don't try to guess
+        return _identity
+
+    criterion = getattr(net, net._criteria[0] + '_')
+    # unwrap optimizer in case of torch.compile being used
+    criterion = getattr(criterion, '_orig_mod', criterion)
 
     if isinstance(criterion, CrossEntropyLoss):
         return partial(torch.softmax, dim=-1)
@@ -623,17 +670,35 @@ def _infer_predict_nonlinearity(net):
     if isinstance(criterion, BCEWithLogitsLoss):
         return _sigmoid_then_2d
 
-    # TODO only needed if multiclass GP classfication is added
-    # likelihood = getattr(net, 'likelihood_', None)
-    # if (
-    #         likelihood
-    #         and GPYTORCH_INSTALLED
-    #         and isinstance(likelihood, gpytorch.likelihoods.SoftmaxLikelihood)
-    # ):
-    #     # SoftmaxLikelihood returns batch second order
-    #     return _transpose
+    if isinstance(criterion, BCELoss):
+        return _make_2d_probs
 
     return _identity
+
+    # TODO: Add the code below to _infer_predict_nonlinearity if multiclass GP
+    # classfication is added.
+    # likelihood = getattr(net, 'likelihood_', None)
+    # if likelihood is None:
+    #     return _identity
+    # nonlin = _identity
+    # try:
+    #     import gpytorch
+    #     if isinstance(likelihood, gpytorch.likelihoods.SoftmaxLikelihood):
+    #         # SoftmaxLikelihood returns batch second order
+    #         nonlin = _transpose
+    # except ImportError:
+    #     # there is no gpytorch install
+    #     pass
+    # except AttributeError:
+    #     # gpytorch and pytorch are incompatible
+    #     msg = (
+    #         "Importing gpytorch failed. This is probably because its version is "
+    #         "incompatible with the installed torch version. Please visit "
+    #         "https://github.com/cornellius-gp/gpytorch#installation to check "
+    #         "which versions are compatible"
+    #     )
+    #     warnings.warn(msg)
+    # return nonlin
 
 
 class TeeGenerator:
@@ -704,3 +769,50 @@ def _check_f_arguments(caller_name, **kwargs):
             key = 'module_' if key == 'f_params' else key[2:] + '_'
             kwargs_module[key] = val
     return kwargs_module, kwargs_other
+
+
+def get_default_torch_load_kwargs():
+    """Returns the kwargs passed to torch.load that correspond to the current
+    torch version.
+
+    PyTorch switches from weights_only=False to True in version 2.6.0.
+
+    """
+    # TODO: Remove once PyTorch 2.5 is no longer supported
+    version_torch = Version(torch.__version__)
+    version_default_switch = Version('2.6.0')
+    if version_torch >= version_default_switch:
+        return {"weights_only": True}
+    return {"weights_only": False}
+
+
+class _TorchLoadUnpickler(pickle.Unpickler):
+    """
+    Subclass of pickle.Unpickler that intercepts 'torch.storage._load_from_bytes' calls
+    and uses `torch.load(..., map_location=..., torch_load_kwargs=...)`.
+
+    This way, we can use normal pickle when unpickling a skorch net but still benefit
+    from torch.load to handle the map_location. Note that `with torch.device(...)` does
+    not work for unpickling.
+
+    """
+
+    def __init__(self, *args, map_location, torch_load_kwargs, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.map_location = map_location
+        self.torch_load_kwargs = torch_load_kwargs
+
+    def find_class(self, module, name):
+        # The actual serialized data for PyTorch tensors references
+        # torch.storage._load_from_bytes internally. We intercept that call:
+        if (module == 'torch.storage') and (name == '_load_from_bytes'):
+            # Return a function that uses torch.load with our desired map_location
+            def _load_from_bytes(b):
+                return torch.load(
+                    io.BytesIO(b),
+                    map_location=self.map_location,
+                    **self.torch_load_kwargs
+                )
+            return _load_from_bytes
+
+        return super().find_class(module, name)

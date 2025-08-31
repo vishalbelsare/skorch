@@ -1,7 +1,5 @@
 """Integrate GPyTorch for Gaussian Processes
 
-TODO: verify the assumptions being made and remove from here:
-
 - The criterion always takes likelihood and module as input arguments
 - Always optimize the negative objective function
 - Need elaboration on how batching works - are distributions disjoint?
@@ -10,11 +8,11 @@ TODO: verify the assumptions being made and remove from here:
 
 import pickle
 import re
-import warnings
 
 import gpytorch
 import numpy as np
 import torch
+from sklearn.base import ClassifierMixin, RegressorMixin
 
 from skorch.net import NeuralNet
 from skorch.dataset import ValidSplit
@@ -23,16 +21,12 @@ from skorch.callbacks import EpochScoring
 from skorch.callbacks import EpochTimer
 from skorch.callbacks import PassthroughScoring
 from skorch.callbacks import PrintLog
-from skorch.exceptions import SkorchWarning
 from skorch.utils import check_is_fitted
 from skorch.utils import get_dim
 from skorch.utils import is_dataset
 from skorch.utils import to_numpy
 from skorch.utils import to_tensor
 
-
-warnings.warn("The API of the Gaussian Process estimators is experimental and may "
-              "change in the future", SkorchWarning)
 
 __all__ = ['ExactGPRegressor', 'GPRegressor', 'GPBinaryClassifier']
 
@@ -398,7 +392,7 @@ class GPBase(NeuralNet):
             raise pickle.PicklingError(msg) from exc
 
 
-class _GPRegressorPredictMixin:
+class _GPRegressorPredictMixin(RegressorMixin):
     """Mixin class that provides a predict method for GP regressors."""
     def predict(self, X, return_std=False, return_cov=False):
         """Returns the predicted mean and optionally standard deviation.
@@ -785,7 +779,7 @@ def get_gp_binary_clf_doc(doc):
     return doc
 
 
-class GPBinaryClassifier(GPBase):
+class GPBinaryClassifier(ClassifierMixin, GPBase):
     __doc__ = get_gp_binary_clf_doc(NeuralNet.__doc__)
 
     def __init__(

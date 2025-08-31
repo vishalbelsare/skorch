@@ -312,7 +312,7 @@ def parse_args(kwargs, defaults=None):
     kwargs : dict
       The arguments as parsed by fire.
 
-    defautls : dict or None (default=None)
+    defaults : dict or None (default=None)
       Optionally, change the default values to use custom
       defaults. Commandline arguments have precedence over defaults.
 
@@ -329,13 +329,17 @@ def parse_args(kwargs, defaults=None):
     try:
         import fire  # pylint: disable=unused-import
     except ImportError:
-        raise ImportError("Using skorch cli helpers requires the fire library,"
-                          " you can install it with pip: pip install fire.")
+        raise ImportError(
+            "Using skorch cli helpers requires the fire library,"
+            " you can install it with pip: python -m pip install fire."
+        )
     try:
         import numpydoc.docscrape  # pylint: disable=unused-import
     except ImportError:
-        raise ImportError("Using skorch cli helpers requires the numpydoc library,"
-                          " you can install it with pip: pip install numpydoc.")
+        raise ImportError(
+            "Using skorch cli helpers requires the numpydoc library,"
+            " you can install it with pip: python -m pip install numpydoc."
+        )
 
     defaults = defaults or {}
 

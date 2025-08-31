@@ -1,9 +1,10 @@
 """Helper functions and classes for users.
 
-They should not be used in skorch directly.
+They are intended to be used by end users but should not be depended upon for
+skorch-internal usage.
 
 """
-from collections import Sequence
+from collections.abc import Sequence
 from functools import partial
 
 import numpy as np
@@ -11,10 +12,22 @@ from sklearn.base import BaseEstimator
 from sklearn.base import TransformerMixin
 import torch
 
-from skorch.cli import parse_args  # pylint: disable=unused-import
+from skorch._doctor import SkorchDoctor
+from skorch.cli import parse_args
 from skorch.utils import _make_split
+from skorch.utils import to_numpy
 from skorch.utils import is_torch_data_type
 from skorch.utils import to_tensor
+
+
+__all__ = [
+    "DataFrameTransformer",
+    "SliceDataset",
+    "SkorchDoctor",
+    "SliceDict",
+    "predefined_split",
+    "parse_args",
+]
 
 
 class SliceDict(dict):
@@ -52,7 +65,7 @@ class SliceDict(dict):
         else:
             self._len = lengths[0]
 
-        super(SliceDict, self).__init__(**kwargs)
+        super().__init__(**kwargs)
 
     def __len__(self):
         return self._len
@@ -64,8 +77,8 @@ class SliceDict(dict):
             # lengths and shapes.
             raise ValueError("SliceDict cannot be indexed by integers.")
         if isinstance(sl, str):
-            return super(SliceDict, self).__getitem__(sl)
-        return SliceDict(**{k: v[sl] for k, v in self.items()})
+            return super().__getitem__(sl)
+        return type(self)(**{k: v[sl] for k, v in self.items()})
 
     def __setitem__(self, key, value):
         if not isinstance(key, str):
@@ -80,14 +93,14 @@ class SliceDict(dict):
                 "Cannot set array with shape[0] != {}"
                 "".format(self._len))
 
-        super(SliceDict, self).__setitem__(key, value)
+        super().__setitem__(key, value)
 
     def update(self, kwargs):
         for key, value in kwargs.items():
             self.__setitem__(key, value)
 
     def __repr__(self):
-        out = super(SliceDict, self).__repr__()
+        out = super().__repr__()
         return "SliceDict(**{})".format(out)
 
     @property
@@ -232,18 +245,27 @@ class SliceDataset(Sequence):
             Xi = self._select_item(Xn)
             return self.transform(Xi)
 
+        cls = type(self)
         if isinstance(i, slice):
-            return SliceDataset(self.dataset, idx=self.idx, indices=self.indices_[i])
+            return cls(self.dataset, idx=self.idx, indices=self.indices_[i])
 
         if isinstance(i, np.ndarray):
             if i.ndim != 1:
                 raise IndexError("SliceDataset only supports slicing with 1 "
                                  "dimensional arrays, got {} dimensions instead."
                                  "".format(i.ndim))
-            if i.dtype == np.bool:
+            if i.dtype == bool:
                 i = np.flatnonzero(i)
 
-        return SliceDataset(self.dataset, idx=self.idx, indices=self.indices_[i])
+        return cls(self.dataset, idx=self.idx, indices=self.indices_[i])
+
+    def __array__(self, dtype=None):
+        # This method is invoked when calling np.asarray(X)
+        # https://numpy.org/devdocs/user/basics.dispatch.html
+        X = [self[i] for i in range(len(self))]
+        if np.isscalar(X[0]):
+            return np.asarray(X)
+        return np.asarray([to_numpy(x) for x in X], dtype=dtype)
 
 
 def predefined_split(dataset):
@@ -348,8 +370,6 @@ class DataFrameTransformer(BaseEstimator, TransformerMixin):
     contains 1 column.
 
     """
-    import pandas as pd
-
     def __init__(
             self,
             treat_int_as_categorical=False,
@@ -377,6 +397,8 @@ class DataFrameTransformer(BaseEstimator, TransformerMixin):
           If a wrong dtype is found.
 
         """
+        import pandas as pd
+
         if 'X' in df:
             raise ValueError(
                 "DataFrame contains a column named 'X', which clashes "
@@ -386,7 +408,7 @@ class DataFrameTransformer(BaseEstimator, TransformerMixin):
         wrong_dtypes = []
 
         for col, dtype in zip(df, df.dtypes):
-            if isinstance(dtype, self.pd.api.types.CategoricalDtype):
+            if isinstance(dtype, pd.api.types.CategoricalDtype):
                 continue
             if np.issubdtype(dtype, np.integer):
                 continue
@@ -425,6 +447,8 @@ class DataFrameTransformer(BaseEstimator, TransformerMixin):
           respective column names as keys.
 
         """
+        import pandas as pd
+
         self._check_dtypes(df)
 
         X_dict = {}
@@ -433,7 +457,7 @@ class DataFrameTransformer(BaseEstimator, TransformerMixin):
         for col, dtype in zip(df, df.dtypes):
             X_col = df[col]
 
-            if isinstance(dtype, self.pd.api.types.CategoricalDtype):
+            if isinstance(dtype, pd.api.types.CategoricalDtype):
                 x = X_col.cat.codes.values
                 if self.int_dtype is not None:
                     x = x.astype(self.int_dtype)

@@ -6,16 +6,17 @@ that is general to NeuralNet class.
 """
 
 import copy
-from distutils.version import LooseVersion
 from functools import partial
 import os
 from pathlib import Path
 import pickle
 import re
 from unittest.mock import Mock
+from unittest.mock import call
 from unittest.mock import patch
 import sys
 import time
+import warnings
 from contextlib import ExitStack
 
 from flaky import flaky
@@ -30,6 +31,7 @@ from sklearn.preprocessing import StandardScaler
 import torch
 from torch import nn
 
+import skorch
 from skorch.tests.conftest import INFERENCE_METHODS
 from skorch.utils import flatten
 from skorch.utils import to_numpy
@@ -172,7 +174,7 @@ class TestNeuralNet:
             assert param is opt_param
 
     def test_net_init_one_unknown_argument(self, net_cls, module_cls):
-        with pytest.raises(TypeError) as e:
+        with pytest.raises(ValueError) as e:
             net_cls(module_cls, unknown_arg=123).initialize()
 
         expected = ("__init__() got unexpected argument(s) unknown_arg. "
@@ -182,7 +184,7 @@ class TestNeuralNet:
         assert e.value.args[0] == expected
 
     def test_net_init_two_unknown_arguments(self, net_cls, module_cls):
-        with pytest.raises(TypeError) as e:
+        with pytest.raises(ValueError) as e:
             net_cls(module_cls, lr=0.1, mxa_epochs=5,
                     warm_start=False, bathc_size=20).initialize()
 
@@ -203,7 +205,7 @@ class TestNeuralNet:
     def test_net_init_missing_dunder_in_prefix_argument(
             self, net_cls, module_cls, name, suggestion):
         # forgot to use double-underscore notation
-        with pytest.raises(TypeError) as e:
+        with pytest.raises(ValueError) as e:
             net_cls(module_cls, **{name: 123}).initialize()
 
         tmpl = "Got an unexpected argument {}, did you mean {}?"
@@ -213,7 +215,7 @@ class TestNeuralNet:
     def test_net_init_missing_dunder_in_2_prefix_arguments(
             self, net_cls, module_cls):
         # forgot to use double-underscore notation in 2 arguments
-        with pytest.raises(TypeError) as e:
+        with pytest.raises(ValueError) as e:
             net_cls(
                 module_cls,
                 max_epochs=7,  # correct
@@ -229,7 +231,7 @@ class TestNeuralNet:
     def test_net_init_missing_dunder_and_unknown(
             self, net_cls, module_cls):
         # unknown argument and forgot to use double-underscore notation
-        with pytest.raises(TypeError) as e:
+        with pytest.raises(ValueError) as e:
             net_cls(
                 module_cls,
                 foobar=123,
@@ -264,19 +266,24 @@ class TestNeuralNet:
         # "optimizer_2".
         MyNet(module_cls, optimizer_2__lr=0.123)  # should not raise
 
-    def test_net_init_with_iterator_valid_shuffle_true(
+    def test_net_init_with_iterator_valid_shuffle_false_no_warning(
+            self, net_cls, module_cls, recwarn):
+        # If a user sets iterator_valid__shuffle=False, everything is good and
+        # no warning should be issued, see
+        # https://github.com/skorch-dev/skorch/issues/907
+        net_cls(module_cls, iterator_valid__shuffle=False).initialize()
+        assert not recwarn.list
+
+    def test_net_init_with_iterator_valid_shuffle_true_warns(
             self, net_cls, module_cls, recwarn):
         # If a user sets iterator_valid__shuffle=True, they might be
         # in for a surprise, since predict et al. will result in
         # shuffled predictions. It is best to warn about this, since
         # most of the times, this is not what users actually want.
         expected = (
-            "You set iterator_valid__shuffle=True; this is most likely not what you want "
-            "because the values returned by predict and predict_proba will be shuffled.")
-
-        # no warning expected here
-        net_cls(module_cls, iterator_valid__shuffle=False)
-        assert not recwarn.list
+            "You set iterator_valid__shuffle=True; this is most likely not what you "
+            "want because the values returned by predict and predict_proba will be "
+            "shuffled.")
 
         # warning expected here
         with pytest.warns(UserWarning, match=expected):
@@ -287,7 +294,7 @@ class TestNeuralNet:
         pass
 
     @pytest.mark.parametrize('method', INFERENCE_METHODS)
-    def test_not_fitted_raises(self, net_cls, module_cls, data, method):
+    def test_not_init_raises(self, net_cls, module_cls, data, method):
         from skorch.exceptions import NotInitializedError
         net = net_cls(module_cls)
         X = data[0]
@@ -298,6 +305,21 @@ class TestNeuralNet:
         msg = ("This NeuralNetClassifier instance is not initialized yet. "
                "Call 'initialize' or 'fit' with appropriate arguments "
                "before using this method.")
+        assert exc.value.args[0] == msg
+
+    def test_not_fitted_raises(self, net_cls, module_cls):
+        from sklearn.utils.validation import check_is_fitted
+        from sklearn.exceptions import NotFittedError
+    
+        net = net_cls(module_cls)
+        with pytest.raises(NotFittedError) as exc:
+            check_is_fitted(net)
+
+        msg = (
+            "This NeuralNetClassifier instance is not fitted yet. "
+            "Call 'fit' with appropriate arguments before "
+            "using this estimator."
+        )
         assert exc.value.args[0] == msg
 
     def test_not_fitted_other_attributes(self, module_cls):
@@ -383,6 +405,22 @@ class TestNeuralNet:
         score_after = accuracy_score(y, net_new.predict(X))
         assert np.isclose(score_after, score_before)
 
+    def test_pickle_save_load_device_is_none(self, net_pickleable):
+        # It is legal to set device=None, but in that case we cannot know what
+        # device was meant, so we should fall back to CPU.
+        from skorch.exceptions import DeviceWarning
+
+        net_pickleable.set_params(device=None)
+        msg = (
+            f"Setting self.device = cpu since the requested device "
+            f"was not specified"
+        )
+        with pytest.warns(DeviceWarning, match=msg):
+            net_loaded = pickle.loads(pickle.dumps(net_pickleable))
+
+        params = net_loaded.get_all_learnable_params()
+        assert all(param.device.type == 'cpu' for _, param in params)
+
     def train_picklable_cuda_net(self, net_pickleable, data):
         X, y = data
         w = torch.FloatTensor([1.] * int(y.max() + 1)).to('cuda')
@@ -447,6 +485,7 @@ class TestNeuralNet:
             cuda_available,
             load_dev,
             expect_warning,
+            recwarn,
     ):
         from skorch.exceptions import DeviceWarning
         net = net_cls(module=module_cls, device=save_dev).initialize()
@@ -458,9 +497,12 @@ class TestNeuralNet:
 
         with patch('torch.cuda.is_available', lambda *_: cuda_available):
             with open(str(p), 'rb') as f:
-                expected_warning = DeviceWarning if expect_warning else None
-                with pytest.warns(expected_warning) as w:
+                if not expect_warning:
                     m = pickle.load(f)
+                    assert not any(w.category == DeviceWarning for w in recwarn.list)
+                else:
+                    with pytest.warns(DeviceWarning) as w:
+                        m = pickle.load(f)
 
         assert torch.device(m.device) == torch.device(load_dev)
 
@@ -468,11 +510,17 @@ class TestNeuralNet:
             # We should have captured two warnings:
             # 1. one for the failed load
             # 2. for switching devices on the net instance
-            assert len(w.list) == 2
-            assert w.list[0].message.args[0] == (
+            # remove possible future warning about weights_only=False
+            # TODO: remove filter when torch<=2.4 is dropped
+            w_list = [
+                warning for warning in w.list
+                if "weights_only=False" not in warning.message.args[0]
+            ]
+            assert len(w_list) == 2
+            assert w_list[0].message.args[0] == (
                 'Requested to load data to CUDA but no CUDA devices '
                 'are available. Loading on device "cpu" instead.')
-            assert w.list[1].message.args[0] == (
+            assert w_list[1].message.args[0] == (
                 'Setting self.device = {} since the requested device ({}) '
                 'is not available.'.format(load_dev, save_dev))
 
@@ -536,8 +584,20 @@ class TestNeuralNet:
         with pytest.raises(AttributeError, match=msg):
             net_fit.load_params(f_unknown='some-file.pt')
 
+    def test_load_params_no_warning(self, net_fit, tmp_path, recwarn):
+        # See discussion in 1063
+        # Ensure that there is no FutureWarning (and DeprecationWarning for good
+        # measure) caused by torch.load.
+        net_fit.save_params(f_params=tmp_path / 'weights.pt')
+        net_fit.load_params(f_params=tmp_path / 'weights.pt')
+        assert not any(
+            isinstance(warning.message, (DeprecationWarning, FutureWarning))
+            for warning in recwarn.list
+        )
+
+    @pytest.mark.parametrize('use_safetensors', [False, True])
     def test_save_load_state_dict_file(
-            self, net_cls, module_cls, net_fit, data, tmpdir):
+            self, net_cls, module_cls, net_fit, data, tmpdir, use_safetensors):
         net = net_cls(module_cls).initialize()
         X, y = data
 
@@ -547,16 +607,17 @@ class TestNeuralNet:
 
         p = tmpdir.mkdir('skorch').join('testmodel.pkl')
         with open(str(p), 'wb') as f:
-            net_fit.save_params(f_params=f)
+            net_fit.save_params(f_params=f, use_safetensors=use_safetensors)
         del net_fit
         with open(str(p), 'rb') as f:
-            net.load_params(f_params=f)
+            net.load_params(f_params=f, use_safetensors=use_safetensors)
 
         score_after = accuracy_score(y, net.predict(X))
         assert np.isclose(score_after, score_before)
 
+    @pytest.mark.parametrize('use_safetensors', [False, True])
     def test_save_load_state_dict_str(
-            self, net_cls, module_cls, net_fit, data, tmpdir):
+            self, net_cls, module_cls, net_fit, data, tmpdir, use_safetensors):
         net = net_cls(module_cls).initialize()
         X, y = data
 
@@ -565,9 +626,9 @@ class TestNeuralNet:
         assert not np.isclose(score_before, score_untrained)
 
         p = tmpdir.mkdir('skorch').join('testmodel.pkl')
-        net_fit.save_params(f_params=str(p))
+        net_fit.save_params(f_params=str(p), use_safetensors=use_safetensors)
         del net_fit
-        net.load_params(f_params=str(p))
+        net.load_params(f_params=str(p), use_safetensors=use_safetensors)
 
         score_after = accuracy_score(y, net.predict(X))
         assert np.isclose(score_after, score_before)
@@ -609,6 +670,49 @@ class TestNeuralNet:
         assert net._modules == ['module']
         assert net._criteria == ['criterion']
         assert net._optimizers == ['optimizer']
+
+    @pytest.mark.parametrize('file_str', [True, False])
+    def test_save_load_safetensors_used(self, net_fit, file_str, tmpdir):
+        # Safetensors' capacity to save and load net params is already covered
+        # in other tests. This is a test to exclude the (trivial) bug that even
+        # with use_safetensors=True, safetensors is not actually being used
+        # (instead accidentally using pickle or something like that). To test
+        # this, we directly open the stored file using safetensors and check its
+        # contents. If it were, say, a pickle file, this test would fail.
+        from safetensors import safe_open
+
+        p = tmpdir.mkdir('skorch').join('testmodel.safetensors')
+
+        if file_str:
+            net_fit.save_params(f_params=str(p), use_safetensors=True)
+        else:
+            with open(str(p), 'wb') as f:
+                net_fit.save_params(f_params=f, use_safetensors=True)
+
+        state_dict_loaded = {}
+        with safe_open(str(p), framework='pt', device=net_fit.device) as f:
+            for key in f.keys():
+                state_dict_loaded[key] = f.get_tensor(key)
+
+        state_dict = net_fit.module_.state_dict()
+        assert state_dict_loaded.keys() == state_dict.keys()
+        for key in state_dict:
+            torch.testing.assert_close(state_dict[key], state_dict_loaded[key])
+
+    def test_save_optimizer_with_safetensors_raises(self, net_cls, module_cls, tmpdir):
+        # safetensors cannot safe anything except for tensors. The state_dict of
+        # the optimizer contains other stuff. Therefore, an error with a helpful
+        # message is raised.
+        p = tmpdir.mkdir('skorch').join('optimizer.safetensors')
+        net = net_cls(module_cls).initialize()
+
+        with pytest.raises(ValueError) as exc:
+            net.save_params(f_optimizer=str(p), use_safetensors=True)
+
+            msg = exc.value.args[0]
+            assert msg.startswith("You are trying to store")
+            assert "optimizer.safetensors" in msg
+            assert msg.endswith("don't use safetensors.")
 
     @pytest.fixture(scope='module')
     def net_fit_adam(self, net_cls, module_cls, data):
@@ -719,9 +823,10 @@ class TestNeuralNet:
         assert orig_steps == new_steps
 
     @pytest.mark.parametrize("explicit_init", [True, False])
+    @pytest.mark.parametrize('use_safetensors', [False, True])
     def test_save_and_load_from_checkpoint(
             self, net_cls, module_cls, data, checkpoint_cls, tmpdir,
-            explicit_init):
+            explicit_init, use_safetensors):
 
         skorch_dir = tmpdir.mkdir('skorch')
         f_params = skorch_dir.join('params.pt')
@@ -729,12 +834,18 @@ class TestNeuralNet:
         f_criterion = skorch_dir.join('criterion.pt')
         f_history = skorch_dir.join('history.json')
 
-        cp = checkpoint_cls(
+        kwargs = dict(
             monitor=None,
             f_params=str(f_params),
             f_optimizer=str(f_optimizer),
             f_criterion=str(f_criterion),
-            f_history=str(f_history))
+            f_history=str(f_history),
+            use_safetensors=use_safetensors,
+        )
+        if use_safetensors:
+            # safetensors cannot safe optimizers
+            kwargs['f_optimizer'] = None
+        cp = checkpoint_cls(**kwargs)
         net = net_cls(
             module_cls, max_epochs=4, lr=0.1,
             optimizer=torch.optim.Adam, callbacks=[cp])
@@ -742,16 +853,18 @@ class TestNeuralNet:
         del net
 
         assert f_params.exists()
-        assert f_optimizer.exists()
         assert f_criterion.exists()
         assert f_history.exists()
+        if not use_safetensors:
+            # safetensors cannot safe optimizers
+            assert f_optimizer.exists()
 
         new_net = net_cls(
             module_cls, max_epochs=4, lr=0.1,
             optimizer=torch.optim.Adam, callbacks=[cp])
         if explicit_init:
             new_net.initialize()
-        new_net.load_params(checkpoint=cp)
+        new_net.load_params(checkpoint=cp, use_safetensors=use_safetensors)
 
         assert len(new_net.history) == 4
 
@@ -776,8 +889,9 @@ class TestNeuralNet:
         assert exp_basedir.join('unet_optimizer.pt').exists()
         assert exp_basedir.join('unet_history.json').exists()
 
+    @pytest.mark.parametrize('use_safetensors', [False, True])
     def test_save_and_load_from_checkpoint_formatting(
-            self, net_cls, module_cls, data, checkpoint_cls, tmpdir):
+            self, net_cls, module_cls, data, checkpoint_cls, tmpdir, use_safetensors):
 
         def epoch_3_scorer(net, *_):
             return 1 if net.history[-1, 'epoch'] == 3 else 0
@@ -787,21 +901,23 @@ class TestNeuralNet:
             scoring=epoch_3_scorer, on_train=True)
 
         skorch_dir = tmpdir.mkdir('skorch')
-        f_params = skorch_dir.join(
-            'model_epoch_{last_epoch[epoch]}.pt')
-        f_optimizer = skorch_dir.join(
-            'optimizer_epoch_{last_epoch[epoch]}.pt')
-        f_criterion = skorch_dir.join(
-            'criterion_epoch_{last_epoch[epoch]}.pt')
-        f_history = skorch_dir.join(
-            'history.json')
+        f_params = skorch_dir.join('model_epoch_{last_epoch[epoch]}.pt')
+        f_optimizer = skorch_dir.join('optimizer_epoch_{last_epoch[epoch]}.pt')
+        f_criterion = skorch_dir.join('criterion_epoch_{last_epoch[epoch]}.pt')
+        f_history = skorch_dir.join('history.json')
 
-        cp = checkpoint_cls(
+        kwargs = dict(
             monitor='epoch_3_scorer',
             f_params=str(f_params),
             f_optimizer=str(f_optimizer),
             f_criterion=str(f_criterion),
-            f_history=str(f_history))
+            f_history=str(f_history),
+            use_safetensors=use_safetensors,
+        )
+        if use_safetensors:
+            # safetensors cannot safe optimizers
+            kwargs['f_optimizer'] = None
+        cp = checkpoint_cls(**kwargs)
 
         net = net_cls(
             module_cls, max_epochs=5, lr=0.1,
@@ -812,16 +928,18 @@ class TestNeuralNet:
         del net
 
         assert skorch_dir.join('model_epoch_3.pt').exists()
-        assert skorch_dir.join('optimizer_epoch_3.pt').exists()
         assert skorch_dir.join('criterion_epoch_3.pt').exists()
         assert skorch_dir.join('history.json').exists()
+        if not use_safetensors:
+            # safetensors cannot safe optimizers
+            assert skorch_dir.join('optimizer_epoch_3.pt').exists()
 
         new_net = net_cls(
             module_cls, max_epochs=5, lr=0.1,
             optimizer=torch.optim.Adam, callbacks=[
                 ('my_score', scoring), cp
             ])
-        new_net.load_params(checkpoint=cp)
+        new_net.load_params(checkpoint=cp, use_safetensors=use_safetensors)
 
         # original run saved checkpoint at epoch 3
         assert len(new_net.history) == 3
@@ -901,6 +1019,10 @@ class TestNeuralNet:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="no cuda device")
     def test_save_load_state_cuda_intercompatibility(
             self, net_cls, module_cls, tmpdir):
+        # This test checks that cuda weights can be loaded even without cuda,
+        # falling back to 'cpu', but there should be a warning. This test does
+        # not work with safetensors. The reason is probably that the patch does
+        # not affect safetensors.
         from skorch.exceptions import DeviceWarning
         net = net_cls(module_cls, device='cuda').initialize()
 
@@ -916,17 +1038,18 @@ class TestNeuralNet:
             'are available. Loading on device "cpu" instead.')
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="no cuda device")
+    @pytest.mark.parametrize('use_safetensors', [False, True])
     def test_save_params_cuda_load_params_cpu_when_cuda_available(
-            self, net_cls, module_cls, data, tmpdir):
+            self, net_cls, module_cls, data, use_safetensors, tmpdir):
         # Test that if we have a cuda device, we can save cuda
         # parameters and then load them to cpu
         X, y = data
         net = net_cls(module_cls, device='cuda', max_epochs=1).fit(X, y)
         p = tmpdir.mkdir('skorch').join('testmodel.pkl')
-        net.save_params(f_params=str(p))
+        net.save_params(f_params=str(p), use_safetensors=use_safetensors)
 
         net2 = net_cls(module_cls, device='cpu').initialize()
-        net2.load_params(f_params=str(p))
+        net2.load_params(f_params=str(p), use_safetensors=use_safetensors)
         net2.predict(X)  # does not raise
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="no cuda device")
@@ -976,12 +1099,7 @@ class TestNeuralNet:
             self, net_cls, module_cls, net_fit, tmpdir, converter):
         # Test loading/saving with different kinds of path representations.
 
-        if converter is Path and sys.version < '3.6':
-            # `PosixPath` cannot be `open`ed in Python < 3.6
-            pytest.skip()
-
         net = net_cls(module_cls).initialize()
-
         history_before = net_fit.history
 
         p = tmpdir.mkdir('skorch').join('history.json')
@@ -1018,6 +1136,19 @@ class TestNeuralNet:
     def test_history_is_filled(self, net_fit):
         assert len(net_fit.history) == net_fit.max_epochs
 
+    def test_initializing_net_with_custom_history(self, net_cls, module_cls, data):
+        # It is possible to pass a custom history instance to the net and have
+        # the net use said history
+        from skorch.history import History
+
+        class MyHistory(History):
+            pass
+
+        net = net_cls(module_cls, history=MyHistory(), max_epochs=3)
+        X, y = data
+        net.fit(X[:100], y[:100])
+        assert isinstance(net.history, MyHistory)
+
     def test_set_params_works(self, net, data):
         X, y = data
         net.fit(X, y)
@@ -1038,6 +1169,27 @@ class TestNeuralNet:
         assert isinstance(net.module_.sequential[1], nn.Tanh)
         assert net.module_.sequential[3].in_features == 20
         assert np.isclose(net.lr, 0.2)
+
+    def test_unknown_set_params_gives_helpful_message(self, net_fit):
+        # test that the error message of set_params includes helpful
+        # information instead of, e.g., generator expressions.
+        # sklearn 0.2x does not output the parameter names so we can
+        # skip detailled checks of the error message there.
+
+        sklearn_0_2x_string = "Check the list of available parameters with `estimator.get_params().keys()`"
+
+        with pytest.raises(ValueError) as e:
+            net_fit.set_params(invalid_parameter_xyz=42)
+
+        exception_str = str(e.value)
+
+        if sklearn_0_2x_string in exception_str:
+            return
+
+        expected_keys = ["module", "criterion"]
+
+        for key in expected_keys:
+            assert key in exception_str[exception_str.find("Valid parameters are: ") :]
 
     def test_set_params_then_initialize_remembers_param(
             self, net_cls, module_cls):
@@ -1756,10 +1908,9 @@ class TestNeuralNet:
     )
   ),
 )"""
-        if LooseVersion(torch.__version__) >= '1.2':
-            expected = expected.replace("Softmax()", "Softmax(dim=-1)")
-            expected = expected.replace("Dropout(p=0.5)",
-                                        "Dropout(p=0.5, inplace=False)")
+        expected = expected.replace("Softmax()", "Softmax(dim=-1)")
+        expected = expected.replace("Dropout(p=0.5)",
+                                    "Dropout(p=0.5, inplace=False)")
         assert result == expected
 
     def test_repr_fitted_works(self, net_cls, module_cls, data):
@@ -1774,23 +1925,19 @@ class TestNeuralNet:
         expected = """<class 'skorch.classifier.NeuralNetClassifier'>[initialized](
   module_=MLPModule(
     (nonlin): PReLU(num_parameters=1)
-    (output_nonlin): Softmax()
+    (output_nonlin): Softmax(dim=-1)
     (sequential): Sequential(
       (0): Linear(in_features=20, out_features=11, bias=True)
       (1): PReLU(num_parameters=1)
-      (2): Dropout(p=0.5)
+      (2): Dropout(p=0.5, inplace=False)
       (3): Linear(in_features=11, out_features=11, bias=True)
       (4): PReLU(num_parameters=1)
-      (5): Dropout(p=0.5)
+      (5): Dropout(p=0.5, inplace=False)
       (6): Linear(in_features=11, out_features=2, bias=True)
-      (7): Softmax()
+      (7): Softmax(dim=-1)
     )
   ),
 )"""
-        if LooseVersion(torch.__version__) >= '1.2':
-            expected = expected.replace("Softmax()", "Softmax(dim=-1)")
-            expected = expected.replace("Dropout(p=0.5)",
-                                        "Dropout(p=0.5, inplace=False)")
         assert result == expected
 
     def test_fit_params_passed_to_module(self, net_cls, data):
@@ -2203,9 +2350,12 @@ class TestNeuralNet:
         with pytest.raises(ValueError) as exc:
             net.set_params(foo=123)
 
-        # TODO: check error message more precisely, depending on what
-        # the intended message should be from sklearn side
-        assert exc.value.args[0].startswith('Invalid parameter foo for')
+        msg = exc.value.args[0]
+        # message contains "'" around variable name starting from sklearn 1.1
+        assert (
+            msg.startswith("Invalid parameter foo for")
+            or msg.startswith("Invalid parameter 'foo' for")
+        )
 
     @pytest.fixture()
     def sequence_module_cls(self):
@@ -2246,11 +2396,13 @@ class TestNeuralNet:
         net.fit(X, y)
 
     def test_net_variable_label_lengths(self, net_cls, sequence_module_cls):
-        # neural net should work fine with varying y_true sequences.
+        # neural net should work fine with variable length y_true sequences.
         X = np.array([1, 5, 3, 6, 2])
-        y = np.array([[1], [1, 0, 1], [1, 1], [1, 1, 0], [1, 0]])
+        y = np.array([[1], [1, 0, 1], [1, 1], [1, 1, 0], [1, 0]], dtype=object)
         X = X[:, np.newaxis].astype('float32')
-        y = np.array([np.array(n, dtype='float32')[:, np.newaxis] for n in y])
+        y = np.array(
+            [np.array(n, dtype='float32')[:, np.newaxis] for n in y], dtype=object
+        )
 
         net = net_cls(
             sequence_module_cls,
@@ -2711,7 +2863,7 @@ class TestNeuralNet:
             self, net_cls, module_cls
     ):
         # When a module references another module, it will yield that modules'
-        # parameters. Therefore, if we collect all paramters, we have to make
+        # parameters. Therefore, if we collect all parameters, we have to make
         # sure that there are no duplicate parameters.
         class MyCriterion(torch.nn.NLLLoss):
             """Criterion that references net.module_"""
@@ -2748,6 +2900,27 @@ class TestNeuralNet:
         net.set_params(lr=456)
         assert net.optimizer_.state_dict()['param_groups'][0]['lr'] == 456
         assert net.myoptimizer_.state_dict()['param_groups'][0]['lr'] == 1
+
+    def test_custom_non_default_module_with_check_is_fitted(
+            self, net_cls, module_cls
+    ):
+        # This is a regression test for a bug fixed in #927. In check_is_fitted
+        # we made the assumption that there is a 'module_' attribute, but we
+        # should not assume that. Here we test that even if such an attribute
+        # doesn't exist, a properly initialized net will not raise an error when
+        # check_is_fitted is called.
+        class MyNet(net_cls):
+            """Net without a 'module_' attribute"""
+            def initialize_module(self):
+                kwargs = self.get_params_for('module')
+                module = self.initialized_instance(self.module, kwargs)
+                # pylint: disable=attribute-defined-outside-init
+                self.mymodule_ = module
+                return self
+
+        net = MyNet(module_cls).initialize()
+        # does not raise
+        net.check_is_fitted()
 
     def test_setattr_custom_module_no_duplicates(self, net_cls, module_cls):
         # the 'module' attribute is set twice but that shouldn't lead
@@ -2824,13 +2997,14 @@ class TestNeuralNet:
         hidden_units = net.custom_.state_dict()['sequential.3.weight'].shape[1]
         assert hidden_units == 99
 
+    @pytest.mark.parametrize('use_safetensors', [False, True])
     def test_save_load_state_dict_custom_module(
-            self, net_custom_module_cls, module_cls, tmpdir):
+            self, net_custom_module_cls, module_cls, use_safetensors, tmpdir):
         # test that we can store and load an arbitrary attribute like 'custom'
         net = net_custom_module_cls(module_cls).initialize()
         weights_before = net.custom_.state_dict()['sequential.3.weight']
         tmpdir_custom = str(tmpdir.mkdir('skorch').join('custom.pkl'))
-        net.save_params(f_custom=tmpdir_custom)
+        net.save_params(f_custom=tmpdir_custom, use_safetensors=use_safetensors)
         del net
 
         # initialize a new net, weights should differ
@@ -2839,9 +3013,164 @@ class TestNeuralNet:
         assert not (weights_before == weights_new).all()
 
         # after loading, weights should be the same again
-        net_new.load_params(f_custom=tmpdir_custom)
+        net_new.load_params(f_custom=tmpdir_custom, use_safetensors=use_safetensors)
         weights_loaded = net_new.custom_.state_dict()['sequential.3.weight']
         assert (weights_before == weights_loaded).all()
+
+    def test_torch_load_kwargs_auto_weights_only_false_when_load_params(
+            self, net_cls, module_cls, monkeypatch, tmp_path
+    ):
+        # Here we assume that the torch version is low enough that weights_only
+        # defaults to False. Check that when no argument is set in skorch, the
+        # right default is used.
+        # See discussion in 1063
+        net = net_cls(module_cls).initialize()
+        net.save_params(f_params=tmp_path / 'params.pkl')
+        state_dict = net.module_.state_dict()
+        expected_kwargs = {"weights_only": False}
+
+        mock_torch_load = Mock(return_value=state_dict)
+        monkeypatch.setattr(torch, "load", mock_torch_load)
+        monkeypatch.setattr(
+            skorch.net, "get_default_torch_load_kwargs", lambda: expected_kwargs
+        )
+
+        net.load_params(f_params=tmp_path / 'params.pkl')
+
+        call_kwargs = mock_torch_load.call_args_list[0].kwargs
+        del call_kwargs['map_location']  # we're not interested in that
+        assert call_kwargs == expected_kwargs
+
+    def test_torch_load_kwargs_auto_weights_only_true_when_load_params(
+            self, net_cls, module_cls, monkeypatch, tmp_path
+    ):
+        # Here we assume that the torch version is high enough that weights_only
+        # defaults to True. Check that when no argument is set in skorch, the
+        # right default is used.
+        # See discussion in 1063
+        net = net_cls(module_cls).initialize()
+        net.save_params(f_params=tmp_path / 'params.pkl')
+        state_dict = net.module_.state_dict()
+        expected_kwargs = {"weights_only": True}
+
+        mock_torch_load = Mock(return_value=state_dict)
+        monkeypatch.setattr(torch, "load", mock_torch_load)
+        monkeypatch.setattr(
+            skorch.net, "get_default_torch_load_kwargs", lambda: expected_kwargs
+        )
+
+        net.load_params(f_params=tmp_path / 'params.pkl')
+
+        call_kwargs = mock_torch_load.call_args_list[0].kwargs
+        del call_kwargs['map_location']  # we're not interested in that
+        assert call_kwargs == expected_kwargs
+
+    def test_torch_load_kwargs_forwarded_to_torch_load(
+            self, net_cls, module_cls, monkeypatch, tmp_path
+    ):
+        # Here we check that custom set torch load args are forwarded to
+        # torch.load.
+        # See discussion in 1063
+        expected_kwargs = {'weights_only': 123, 'foo': 'bar'}
+        net = net_cls(module_cls, torch_load_kwargs=expected_kwargs).initialize()
+        net.save_params(f_params=tmp_path / 'params.pkl')
+        state_dict = net.module_.state_dict()
+
+        mock_torch_load = Mock(return_value=state_dict)
+        monkeypatch.setattr(torch, "load", mock_torch_load)
+
+        net.load_params(f_params=tmp_path / 'params.pkl')
+
+        call_kwargs = mock_torch_load.call_args_list[0].kwargs
+        del call_kwargs['map_location']  # we're not interested in that
+        assert call_kwargs == expected_kwargs
+
+    def test_torch_load_kwargs_auto_weights_false_pytorch_lt_2_6(
+            self, net_cls, module_cls, monkeypatch, tmp_path
+    ):
+        # Same test as
+        # test_torch_load_kwargs_auto_weights_only_false_when_load_params but
+        # without monkeypatching get_default_torch_load_kwargs. The default is
+        # weights_only=False.
+        # See discussion in 1063.
+        from skorch._version import Version
+
+        # TODO remove once torch 2.5.0 is no longer supported
+        if Version(torch.__version__) >= Version('2.6.0'):
+            pytest.skip("Test only for torch < v2.6.0")
+
+        net = net_cls(module_cls).initialize()
+        net.save_params(f_params=tmp_path / 'params.pkl')
+        state_dict = net.module_.state_dict()
+        expected_kwargs = {"weights_only": False}
+
+        mock_torch_load = Mock(return_value=state_dict)
+        monkeypatch.setattr(torch, "load", mock_torch_load)
+        net.load_params(f_params=tmp_path / 'params.pkl')
+
+        call_kwargs = mock_torch_load.call_args_list[0].kwargs
+        del call_kwargs['map_location']  # we're not interested in that
+        assert call_kwargs == expected_kwargs
+
+    def test_torch_load_kwargs_auto_weights_true_pytorch_ge_2_6(
+            self, net_cls, module_cls, monkeypatch, tmp_path
+    ):
+        # Same test as
+        # test_torch_load_kwargs_auto_weights_false_pytorch_lt_2_6 but
+        # with weights_only=True, since it's the new default
+        # See discussion in 1063.
+        from skorch._version import Version
+
+        # TODO remove once torch 2.5.0 is no longer supported
+        if Version(torch.__version__) < Version('2.6.0'):
+            pytest.skip("Test only for torch >= 2.6.0")
+
+        net = net_cls(module_cls).initialize()
+        net.save_params(f_params=tmp_path / 'params.pkl')
+        state_dict = net.module_.state_dict()
+        expected_kwargs = {"weights_only": True}
+
+        mock_torch_load = Mock(return_value=state_dict)
+        monkeypatch.setattr(torch, "load", mock_torch_load)
+        net.load_params(f_params=tmp_path / 'params.pkl')
+
+        call_kwargs = mock_torch_load.call_args_list[0].kwargs
+        del call_kwargs['map_location']  # we're not interested in that
+        assert call_kwargs == expected_kwargs
+
+    def test_torch_load_kwargs_forwarded_to_torch_load_unpickle(
+            self, net_cls, module_cls, monkeypatch, tmp_path
+    ):
+        # See discussion in 1090
+        # Here we check that custom set torch load args are forwarded to
+        # torch.load even when using pickle. This is the same test otherwise as
+        # test_torch_load_kwargs_forwarded_to_torch_load
+        expected_kwargs = {'weights_only': 123, 'foo': 'bar'}
+        net = net_cls(module_cls, torch_load_kwargs=expected_kwargs).initialize()
+
+        original_torch_load = torch.load
+        # call original torch.load without extra params to prevent error:
+        mock_torch_load = Mock(
+            side_effect=lambda *args, **kwargs: original_torch_load(*args)
+        )
+        monkeypatch.setattr(torch, "load", mock_torch_load)
+        dumped = pickle.dumps(net)
+        pickle.loads(dumped)
+
+        call_kwargs = mock_torch_load.call_args_list[0].kwargs
+        del call_kwargs['map_location']  # we're not interested in that
+        assert call_kwargs == expected_kwargs
+
+    def test_unpickle_no_pytorch_warning(self, net_cls, module_cls, recwarn):
+        # See discussion 1090
+        # When using pickle, i.e. when going through __setstate__, we don't want to get
+        # any warnings about the usage of weights_only.
+        net = net_cls(module_cls).initialize()
+        dumped = pickle.dumps(net)
+        pickle.loads(dumped)
+
+        msg_content = "weights_only"
+        assert not any(msg_content in str(w.message) for w in recwarn.list)
 
     def test_custom_module_params_passed_to_optimizer(
             self, net_custom_module_cls, module_cls):
@@ -3088,6 +3417,30 @@ class TestNeuralNet:
         ).initialize()
         assert net.criterion_ is criterion
         assert net.criterion2_ is not criterion2
+
+    def test_custom_criterion_attribute_name_predict_works(
+            self, net_cls, module_cls, data
+    ):
+        # This is a regression test for bugfix in #927. We should not assume
+        # that there is always an attribute called 'criterion_' when trying to
+        # infer the predict nonlinearity.
+        from skorch.utils import to_tensor
+
+        class MyNet(net_cls):
+            def initialize_criterion(self):
+                kwargs = self.get_params_for('criterion')
+                criterion = self.initialized_instance(self.criterion, kwargs)
+                # pylint: disable=attribute-defined-outside-init
+                self.mycriterion_ = criterion  # non-default name
+
+            def get_loss(self, y_pred, y_true, *args, **kwargs):
+                y_true = to_tensor(y_true, device=self.device)
+                return self.mycriterion_(y_pred, y_true)
+
+        net = MyNet(module_cls).initialize()
+        X, y = data[0][:10], data[1][:10]
+        net.fit(X, y)
+        net.predict(X)
 
     def test_custom_module_is_init_when_default_module_already_is(
             self, net_cls, module_cls,
@@ -3534,6 +3887,45 @@ class TestNeuralNet:
         with pytest.raises(TypeError, match=msg):
             net.predict_proba(np.zeros((3, 3)))
 
+    def test_predict_nonlinearity_is_identity_with_multiple_criteria(
+            self, net_cls, module_cls, data
+    ):
+        # Regression test for bugfix so we don't assume that there is always
+        # just a single criterion when trying to infer the predict nonlinearity
+        # (#927). Instead, if there are multiple criteria, don't apply any
+        # predict nonlinearity. In this test, criterion_ is CrossEntropyLoss, so
+        # normally we would apply softmax, but since there is a second criterion
+        # here, we shouldn't. To test that the identity function is used, we
+        # check that predict_proba and forward return the same values.
+        from skorch.utils import to_numpy, to_tensor
+
+        class MyNet(net_cls):
+            def initialize_criterion(self):
+                # pylint: disable=attribute-defined-outside-init
+                kwargs = self.get_params_for('criterion')
+                criterion = self.initialized_instance(nn.CrossEntropyLoss, kwargs)
+                self.criterion_ = criterion  # non-default name
+
+                kwargs = self.get_params_for('criterion2')
+                criterion2 = self.initialized_instance(nn.NLLLoss, kwargs)
+                self.criterion2_ = criterion2
+
+            def get_loss(self, y_pred, y_true, *args, **kwargs):
+                y_true = to_tensor(y_true, device=self.device)
+                loss = self.criterion_(y_pred, y_true)
+                loss2 = self.criterion2_(y_pred, y_true)
+                return loss + loss2
+
+        net = MyNet(module_cls).initialize()
+        X, y = data[0][:10], data[1][:10]
+        net.fit(X, y)
+
+        # test that predict_proba and forward return the same values, hence no
+        # nonlinearity was applied
+        y_proba = net.predict_proba(X)
+        y_forward = to_numpy(net.forward(X))
+        assert np.allclose(y_proba, y_forward)
+
     def test_customize_net_with_custom_dataset_that_returns_3_values(self, data):
         # Test if it's possible to easily customize NeuralNet to work
         # with Datasets that don't return 2 values. This way, a user
@@ -3661,3 +4053,345 @@ class TestNetSparseInput:
         score_end = net.history[-1]['train_loss']
 
         assert score_start > 1.25 * score_end
+
+
+class TestTrimForPrediction:
+    @pytest.fixture
+    def net_untrained(self, classifier_module):
+        """A net with a custom 'module2_' criterion and a progress bar callback"""
+        from skorch import NeuralNetClassifier
+        from skorch.callbacks import ProgressBar
+
+        net = NeuralNetClassifier(
+            classifier_module,
+            max_epochs=2,
+            callbacks=[ProgressBar()],
+        )
+        return net
+
+    @pytest.fixture
+    def net(self, net_untrained, classifier_data):
+        X, y = classifier_data
+        return net_untrained.fit(X[:100], y[:100])
+
+    @pytest.fixture
+    def net_2_criteria(self, classifier_module, classifier_data):
+        """A net with a custom 'module2_' criterion and disabled callbacks"""
+        # Check that not only the standard components are trimmed and that
+        # callbacks don't need to be lists.
+
+        from skorch import NeuralNetClassifier
+
+        class MyNet(NeuralNetClassifier):
+            def initialize_criterion(self):
+                super().initialize_criterion()
+                # pylint: disable=attribute-defined-outside-init
+                self.criterion2_ = classifier_module()
+                return self
+
+        X, y = classifier_data
+        net = MyNet(classifier_module,  max_epochs=2, callbacks='disable')
+        net.fit(X, y)
+        return net
+
+    def test_trimmed_net_less_memory(self, net):
+        # very rough way of checking for smaller memory footprint
+        size_before = len(pickle.dumps(net))
+        net.trim_for_prediction()
+        size_after = len(pickle.dumps(net))
+        # check if there is at least 10% size gain
+        assert 0.9 * size_before > size_after
+
+    def test_trim_untrained_net_raises(self, net_untrained):
+        from skorch.exceptions import NotInitializedError
+
+        with pytest.raises(NotInitializedError):
+            net_untrained.trim_for_prediction()
+
+    def test_try_fitting_trimmed_net_raises(self, net, classifier_data):
+        from skorch.exceptions import SkorchTrainingImpossibleError
+
+        X, y = classifier_data
+        msg = (
+            "The net's attributes were trimmed for prediction, thus it cannot "
+            "be used for training anymore")
+
+        net.trim_for_prediction()
+        with pytest.raises(SkorchTrainingImpossibleError, match=msg):
+            net.fit(X, y)
+
+    def test_try_trimmed_net_partial_fit_raises(
+            self, net, classifier_data
+    ):
+        from skorch.exceptions import SkorchTrainingImpossibleError
+
+        X, y = classifier_data
+        msg = (
+            "The net's attributes were trimmed for prediction, thus it cannot "
+            "be used for training anymore"
+        )
+
+        net.trim_for_prediction()
+        with pytest.raises(SkorchTrainingImpossibleError, match=msg):
+            net.partial_fit(X, y)
+
+    def test_inference_works(self, net, classifier_data):
+        # does not raise
+        net.trim_for_prediction()
+        X, _ = classifier_data
+        net.predict(X)
+        net.predict_proba(X)
+        net.forward(X)
+
+    def test_trim_twice_works(self, net):
+        # does not raise
+        net.trim_for_prediction()
+        net.trim_for_prediction()
+
+    def test_callbacks_trimmed(self, net):
+        net.trim_for_prediction()
+        assert not net.callbacks
+        assert not net.callbacks_
+
+    def test_optimizer_trimmed(self, net):
+        net.trim_for_prediction()
+        assert net.optimizer is None
+        assert net.optimizer_ is None
+
+    def test_criteria_trimmed(self, net_2_criteria):
+        net_2_criteria.trim_for_prediction()
+        assert net_2_criteria.criterion is None
+        assert net_2_criteria.criterion_ is None
+        assert net_2_criteria.criterion2_ is None
+
+    def test_history_trimmed(self, net):
+        net.trim_for_prediction()
+        assert not net.history
+
+    def test_train_iterator_trimmed(self, net):
+        net.trim_for_prediction()
+        assert net.iterator_train is None
+
+    def test_module_training(self, net):
+        # pylint: disable=protected-access
+        net._set_training(True)
+        net.trim_for_prediction()
+        assert net.module_.training is False
+
+    def test_can_be_pickled(self, net):
+        pickle.dumps(net)
+        net.trim_for_prediction()
+        pickle.dumps(net)
+
+    def test_can_be_copied(self, net):
+        copy.deepcopy(net)
+        net.trim_for_prediction()
+        copy.deepcopy(net)
+
+    def test_can_be_cloned(self, net):
+        clone(net)
+        net.trim_for_prediction()
+        clone(net)
+
+
+class TestTorchCompile:
+    """Test functionality related to torch.compile (if available)"""
+    @pytest.fixture(scope='module')
+    def data(self, classifier_data):
+        return classifier_data
+
+    @pytest.fixture(scope='module')
+    def module_cls(self, classifier_module):
+        return classifier_module
+
+    @pytest.fixture(scope='module')
+    def net_cls(self):
+        from skorch import NeuralNetClassifier
+        return NeuralNetClassifier
+
+    @pytest.fixture
+    def mock_compile(self, monkeypatch):
+        """Mock torch.compile, using monkeypatch for v1.14 or above, else just
+        set and delete attribute"""
+        def fake_compile(module, **kwargs):  # pylint: disable=unused-argument
+            # just return the original module
+            return module
+
+        mocked = Mock(side_effect=fake_compile)
+
+        if not hasattr(torch, 'compile'):  # PyTorch <= 1.13
+            # cannot use monkeypatch on non-existing attr
+            try:
+                torch.compile = mocked
+                yield mocked
+            finally:
+                del torch.compile
+        else:
+            monkeypatch.setattr(torch, 'compile', mocked)
+            yield mocked
+
+    def test_no_compile(self, net_cls, module_cls, mock_compile):
+        net_cls(module_cls).initialize()
+        assert mock_compile.call_count == 0
+
+    def test_with_compile_default(self, net_cls, module_cls, mock_compile):
+        net = net_cls(module_cls, compile=True).initialize()
+
+        assert mock_compile.call_count == 2
+        # we can check the call args like this because the mock just returns the
+        # original module
+        assert mock_compile.call_args_list[0] == call(net.module_)
+        assert mock_compile.call_args_list[1] == call(net.criterion_)
+
+    def test_with_compile_extra_params(self, net_cls, module_cls, mock_compile):
+        net = net_cls(
+            module_cls,
+            compile=True,
+            compile__mode='reduce-overhead',
+            compile__dynamic=True,
+            compile__fullgraph=True,
+        ).initialize()
+
+        assert mock_compile.call_count == 2
+        expected_kwargs = {
+            'mode': 'reduce-overhead', 'dynamic': True, 'fullgraph': True
+        }
+        assert mock_compile.call_args_list[0] == call(net.module_, **expected_kwargs)
+        assert mock_compile.call_args_list[1] == call(net.criterion_, **expected_kwargs)
+
+    def test_custom_modules_are_compiled(self, net_cls, module_cls, mock_compile):
+        # ensure that if the user sets custom modules, they are also compiled
+        class MyNet(net_cls):
+            def initialize_module(self):
+                # pylint: disable=attribute-defined-outside-init
+                self.module_ = self.module()
+                self.module2_ = nn.Sequential(nn.Linear(10, 10))
+                return self
+
+            def initialize_criterion(self):
+                # pylint: disable=attribute-defined-outside-init
+                self.mycriterion_ = nn.NLLLoss()
+                return self
+
+        net = MyNet(module_cls, compile=True).initialize()
+
+        assert mock_compile.call_count == 3
+        # we can check the call args like this because the mock just returns the
+        # original module
+        assert mock_compile.call_args_list[0] == call(net.module_)
+        assert mock_compile.call_args_list[1] == call(net.module2_)
+        assert mock_compile.call_args_list[2] == call(net.mycriterion_)
+
+    def test_compile_called_after_set_params(self, net_cls, module_cls, mock_compile):
+        # When calling net.set_params(compile=True), the modules should be compiled
+
+        # start without compile
+        net = net_cls(module_cls).initialize()
+        assert mock_compile.call_count == 0
+
+        net.set_params(compile=True)
+        assert mock_compile.call_count == 2
+
+    def test_compile_called_after_set_params_on_compile_param(
+            self, net_cls, module_cls, mock_compile
+    ):
+        # When calling net.set_params(compile__arg=val), the modules should be
+        # recompiled
+
+        # start with default compile
+        net = net_cls(module_cls, compile=True).initialize()
+        assert mock_compile.call_count == 2
+
+        net.set_params(compile__mode='reduce-overhead')
+        assert mock_compile.call_count == 4
+
+    def test_compile_true_but_not_available_raises(
+            self, net_cls, module_cls, monkeypatch
+    ):
+        if hasattr(torch, 'compile'):
+            monkeypatch.delattr(torch, 'compile')
+
+        msg = "Setting compile=True but torch.compile is not available"
+        with pytest.raises(ValueError, match=msg):
+            net_cls(module_cls, compile=True).initialize()
+
+    def test_compile_missing_dunder_in_prefix_arguments(
+            self, net_cls, module_cls, mock_compile  # pylint: disable=unused-argument
+    ):
+        # forgot to use double-underscore notation in 2 compile arguments
+        msg = (
+            r"Got an unexpected argument compile_dynamic, did you mean "
+            r"compile__dynamic\?\n"
+            r"Got an unexpected argument compilemode, did you mean compile__mode\?"
+        )
+        with pytest.raises(ValueError, match=msg):
+            net_cls(
+                module_cls,
+                compile_dynamic=True,
+                compilemode='reduce-overhead',
+            ).initialize()
+
+    def test_fit_and_predict_with_compile(self, net_cls, module_cls, data):
+        if not hasattr(torch, 'compile'):
+            pytest.skip(reason="torch.compile not available")
+
+        # python 3.12 requires torch >= 2.4 to support compile
+        # TODO: remove once we remove support for torch < 2.4
+        from skorch._version import Version
+
+        if Version(torch.__version__) < Version('2.4.0') and sys.version_info >= (3, 12):
+            pytest.skip(reason="When using Python 3.12, torch.compile requires torch >= 2.4")
+
+        # use real torch.compile, not mocked, can be a bit slow
+        X, y = data
+        net = net_cls(module_cls, max_epochs=1, compile=True).initialize()
+
+        # fitting and predicting does not cause any problems
+        net.fit(X, y)
+        net.predict(X)
+        net.predict_proba(X)
+
+        # it's not clear what the best way is to test that a module was actually
+        # compiled, we rely here on torch keeping this public attribute
+        assert hasattr(net.module_, 'dynamo_ctx')
+        assert hasattr(net.criterion_, 'dynamo_ctx')
+
+    def test_binary_classifier_with_compile(self, data):
+        # issue 1057 the problem was that compile would wrap the optimizer,
+        # resulting in _infer_predict_nonlinearity to return the wrong result
+        # because of a failing isinstance check
+        from skorch import NeuralNetBinaryClassifier
+
+        # python 3.12 requires torch >= 2.4 to support compile
+        # TODO: remove once we remove support for torch < 2.4
+        from skorch._version import Version
+
+        if Version(torch.__version__) < Version('2.4.0') and sys.version_info >= (3, 12):
+            pytest.skip(reason="When using Python 3.12, torch.compile requires torch >= 2.4")
+
+        X, y = data[0], data[1].astype(np.float32)
+
+        class MyNet(nn.Module):
+            def __init__(self):
+                super(MyNet, self).__init__()
+                self.linear = nn.Linear(20, 10)
+                self.output = nn.Linear(10, 1)
+
+            def forward(self, input):
+                out = self.linear(input)
+                out = nn.functional.relu(out)
+                out = self.output(out)
+                return out.squeeze(-1)
+
+        net = NeuralNetBinaryClassifier(
+            MyNet,
+            max_epochs=3,
+            compile=True,
+        )
+        # check that no error is raised
+        net.fit(X, y)
+
+        y_proba = net.predict_proba(X)
+        y_pred = net.predict(X)
+        assert y_proba.shape == (X.shape[0], 2)
+        assert y_pred.shape == (X.shape[0],)
